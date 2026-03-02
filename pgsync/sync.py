@@ -21,6 +21,23 @@ import sqlparse
 from psycopg2 import OperationalError
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
+try:
+    from ddtrace import tracer
+except ImportError:
+    tracer = None
+
+
+def _span(name: str, resource: str = None, **tags):
+    """Return a context manager that creates a Datadog span if tracer is available."""
+    if tracer is None:
+        from contextlib import nullcontext
+        return nullcontext()
+    s = tracer.trace(name, resource=resource or name)
+    for k, v in tags.items():
+        if v is not None:
+            s.set_tag(k, str(v) if not isinstance(v, (int, float, bool)) else v)
+    return s
+
 from . import __version__, settings
 from .base import Base, Payload
 from .constants import (
@@ -492,16 +509,23 @@ class Sync(Base, metaclass=Singleton):
 
             if payloads:
                 # bulk-index each consecutive run of (tg_op, table)
-                for (op, tbl), run in groupby(
-                    payloads,
-                    key=lambda payload: (payload.tg_op, payload.table),
+                with _span(
+                    "pgsync.logical_slot_changes",
+                    resource="pgsync.logical_slot_changes",
+                    slot_name=self.__name,
+                    index=self.index,
+                    batch_size=len(payloads),
                 ):
-                    batch: list = list(run)
-                    logger.debug(f"op: {op} tbl {tbl} - {len(batch)}")
-                    current += len(batch)
-                    self.log_xlog_progress(current, total, bar_length=30)
-                    self.search_client.bulk(self.index, self._payloads(batch))
-                    self.count["xlog"] += len(batch)
+                    for (op, tbl), run in groupby(
+                        payloads,
+                        key=lambda payload: (payload.tg_op, payload.table),
+                    ):
+                        batch: list = list(run)
+                        logger.debug(f"op: {op} tbl {tbl} - {len(batch)}")
+                        current += len(batch)
+                        self.log_xlog_progress(current, total, bar_length=30)
+                        self.search_client.bulk(self.index, self._payloads(batch))
+                        self.count["xlog"] += len(batch)
 
         # mark those rows consumed
         self.logical_slot_get_changes(
@@ -1168,72 +1192,90 @@ class Sync(Base, metaclass=Singleton):
         Yields:
             dict: A dictionary representing a doc to be indexed in Elasticsearch.
         """
-        self.query_builder.isouter = True
-        self.query_builder.from_obj = None
-
-        for node in self.tree.traverse_post_order():
-            node._subquery = None
-            node._filters = []
-            node.setup()
-
-            try:
-                self.query_builder.build_queries(
-                    node, filters=filters, txmin=txmin, txmax=txmax, ctid=ctid
-                )
-            except Exception as e:
-                logger.exception(f"Exception {e}")
-                raise
-
-        if self.verbose:
-            compiled_query(node._subquery, "Query")
-
-        for i, (keys, row, primary_keys) in enumerate(
-            self.fetchmany(node._subquery)
+        root_table = self.tree.root.table if self.tree.root else ""
+        filter_size = (
+            len(filters.get(self.tree.root.table, []))
+            if filters and self.tree.root
+            else 0
+        )
+        with _span(
+            "pgsync.sync",
+            resource="pgsync.sync",
+            index=self.index,
+            table=root_table,
+            filter_size=filter_size,
         ):
-            row: dict = Transform.transform(row, self.nodes)
+            self.query_builder.isouter = True
+            self.query_builder.from_obj = None
 
-            row[META] = Transform.get_primary_keys(keys)
+            for node in self.tree.traverse_post_order():
+                node._subquery = None
+                node._filters = []
+                node.setup()
 
-            if node.is_root:
-                primary_key_values: t.List[str] = list(map(str, primary_keys))
-                primary_key_names: t.List[str] = [
-                    primary_key.name for primary_key in node.primary_keys
-                ]
-                # TODO: add support for composite pkeys
-                row[META][node.table] = {
-                    primary_key_names[0]: [primary_key_values[0]],
-                }
+                try:
+                    with _span(
+                        "pgsync.query_builder.build",
+                        resource="pgsync.query_builder.build",
+                        index=self.index,
+                    ):
+                        self.query_builder.build_queries(
+                            node, filters=filters, txmin=txmin, txmax=txmax, ctid=ctid
+                        )
+                except Exception as e:
+                    logger.exception(f"Exception {e}")
+                    raise
 
             if self.verbose:
-                print(f"{(i+1)})")
-                print(f"pkeys: {primary_keys}")
-                pprint.pprint(row)
-                print("-" * 10)
+                compiled_query(node._subquery, "Query")
 
-            doc: dict = {
-                "_id": self.get_doc_id(primary_keys, node.table),
-                "_index": self.index,
-                "_source": row,
-            }
-
-            if self.routing:
-                doc["_routing"] = row[self.routing]
-
-            if (
-                self.search_client.major_version < 7
-                and not self.search_client.is_opensearch
+            for i, (keys, row, primary_keys) in enumerate(
+                self.fetchmany(node._subquery)
             ):
-                doc["_type"] = "_doc"
+                row: dict = Transform.transform(row, self.nodes)
 
-            if self._plugins:
-                doc = next(self._plugins.transform([doc]))
-                if not doc:
-                    continue
+                row[META] = Transform.get_primary_keys(keys)
 
-            if self.pipeline:
-                doc["pipeline"] = self.pipeline
+                if node.is_root:
+                    primary_key_values: t.List[str] = list(map(str, primary_keys))
+                    primary_key_names: t.List[str] = [
+                        primary_key.name for primary_key in node.primary_keys
+                    ]
+                    # TODO: add support for composite pkeys
+                    row[META][node.table] = {
+                        primary_key_names[0]: [primary_key_values[0]],
+                    }
 
-            yield doc
+                if self.verbose:
+                    print(f"{(i+1)})")
+                    print(f"pkeys: {primary_keys}")
+                    pprint.pprint(row)
+                    print("-" * 10)
+
+                doc: dict = {
+                    "_id": self.get_doc_id(primary_keys, node.table),
+                    "_index": self.index,
+                    "_source": row,
+                }
+
+                if self.routing:
+                    doc["_routing"] = row[self.routing]
+
+                if (
+                    self.search_client.major_version < 7
+                    and not self.search_client.is_opensearch
+                ):
+                    doc["_type"] = "_doc"
+
+                if self._plugins:
+                    doc = next(self._plugins.transform([doc]))
+                    if not doc:
+                        continue
+
+                if self.pipeline:
+                    doc["pipeline"] = self.pipeline
+
+                yield doc
 
     @property
     def checkpoint(self) -> int:
@@ -1312,12 +1354,18 @@ class Sync(Base, metaclass=Singleton):
 
         if payloads:
             logger.debug(f"_poll_redis: {payloads}")
-            with self.lock:
-                self.count["redis"] += len(payloads)
-            self.refresh_views()
-            self.on_publish(
-                list(map(lambda payload: Payload(**payload), payloads))
-            )
+            with _span(
+                "pgsync.poll_redis",
+                resource="pgsync.poll_redis",
+                payload_count=len(payloads),
+                index=self.index,
+            ):
+                with self.lock:
+                    self.count["redis"] += len(payloads)
+                self.refresh_views()
+                self.on_publish(
+                    list(map(lambda payload: Payload(**payload), payloads))
+                )
         time.sleep(settings.REDIS_POLL_INTERVAL)
 
     @threaded
@@ -1335,11 +1383,17 @@ class Sync(Base, metaclass=Singleton):
         payloads: list = self.redis.pop()
         if payloads:
             logger.debug(f"_async_poll_redis: {payloads}")
-            self.count["redis"] += len(payloads)
-            await self.async_refresh_views()
-            await self.async_on_publish(
-                list(map(lambda payload: Payload(**payload), payloads))
-            )
+            with _span(
+                "pgsync.poll_redis",
+                resource="pgsync.poll_redis",
+                payload_count=len(payloads),
+                index=self.index,
+            ):
+                self.count["redis"] += len(payloads)
+                await self.async_refresh_views()
+                await self.async_on_publish(
+                    list(map(lambda payload: Payload(**payload), payloads))
+                )
         await asyncio.sleep(settings.REDIS_POLL_INTERVAL)
 
     @exception
@@ -1374,7 +1428,13 @@ class Sync(Base, metaclass=Singleton):
             ):
                 # Catch any hanging items from the last poll
                 if payloads:
-                    self.redis.push(payloads)
+                    with _span(
+                        "pgsync.poll_db",
+                        resource="pgsync.poll_db",
+                        payload_count=len(payloads),
+                        index=self.index,
+                    ):
+                        self.redis.push(payloads)
                     payloads = []
                 continue
 
@@ -1386,7 +1446,13 @@ class Sync(Base, metaclass=Singleton):
 
             while conn.notifies:
                 if len(payloads) >= settings.REDIS_WRITE_CHUNK_SIZE:
-                    self.redis.push(payloads)
+                    with _span(
+                        "pgsync.poll_db",
+                        resource="pgsync.poll_db",
+                        payload_count=len(payloads),
+                        index=self.index,
+                    ):
+                        self.redis.push(payloads)
                     payloads = []
                 notification: t.AnyStr = conn.notifies.pop(0)
                 if notification.channel == self.database:
@@ -1431,7 +1497,13 @@ class Sync(Base, metaclass=Singleton):
                     and self.index in payload["indices"]
                     and payload["schema"] in self.tree.schemas
                 ):
-                    self.redis.push([payload])
+                    with _span(
+                        "pgsync.poll_db",
+                        resource="pgsync.poll_db",
+                        payload_count=1,
+                        index=self.index,
+                    ):
+                        self.redis.push([payload])
                     logger.debug(f"async_poll: {payload}")
                     self.count["db"] += 1
 
@@ -1461,53 +1533,61 @@ class Sync(Base, metaclass=Singleton):
         It is called when an event is received from Redis/Valkey.
         Deserialize the payload from Redis/Valkey and sync to Elasticsearch/OpenSearch
         """
-        # this is used for the views.
-        # we substitute the views for the base table here
-        for i, payload in enumerate(payloads):
-            for node in self.tree.traverse_breadth_first():
-                if payload.table in node.base_tables:
-                    payloads[i].table = node.table
-
-        logger.debug(f"on_publish len {len(payloads)}")
-        # Safe inserts are insert operations that can be performed in any order
-        # Optimize the safe INSERTS
-        # TODO repeat this for the other place too
-        # if all payload operations are INSERTS
-        if set(map(lambda x: x.tg_op, payloads)) == set([INSERT]):
-            _payloads: dict = defaultdict(list)
-
-            for payload in payloads:
-                _payloads[payload.table].append(payload)
-
-            for _payload in _payloads.values():
-                self.search_client.bulk(self.index, self._payloads(_payload))
-
-        else:
-            _payloads: t.List[Payload] = []
+        with _span(
+            "pgsync.on_publish",
+            resource="pgsync.on_publish",
+            payload_count=len(payloads),
+            index=self.index,
+            tg_ops=",".join(sorted(set(p.tg_op for p in payloads if p.tg_op))),
+            tables=",".join(sorted(set(p.table for p in payloads if p.table))),
+        ):
+            # this is used for the views.
+            # we substitute the views for the base table here
             for i, payload in enumerate(payloads):
-                _payloads.append(payload)
-                j: int = i + 1
-                if j < len(payloads):
-                    payload2 = payloads[j]
-                    if (
-                        payload.tg_op != payload2.tg_op
-                        or payload.table != payload2.table
-                    ):
-                        self.search_client.bulk(
-                            self.index,
-                            self._payloads(_payloads),
-                        )
-                        _payloads = []
-                elif j == len(payloads):
-                    self.search_client.bulk(
-                        self.index, self._payloads(_payloads)
-                    )
-                    _payloads: list = []
+                for node in self.tree.traverse_breadth_first():
+                    if payload.table in node.base_tables:
+                        payloads[i].table = node.table
 
-        txids: t.Set = set(map(lambda x: x.xmin, payloads))
-        # for truncate, tg_op txids is None so skip setting the checkpoint
-        if txids != set([None]):
-            self.checkpoint: int = min(min(txids), self.txid_current) - 1
+            logger.debug(f"on_publish len {len(payloads)}")
+            # Safe inserts are insert operations that can be performed in any order
+            # Optimize the safe INSERTS
+            # TODO repeat this for the other place too
+            # if all payload operations are INSERTS
+            if set(map(lambda x: x.tg_op, payloads)) == set([INSERT]):
+                _payloads: dict = defaultdict(list)
+
+                for payload in payloads:
+                    _payloads[payload.table].append(payload)
+
+                for _payload in _payloads.values():
+                    self.search_client.bulk(self.index, self._payloads(_payload))
+
+            else:
+                _payloads: t.List[Payload] = []
+                for i, payload in enumerate(payloads):
+                    _payloads.append(payload)
+                    j: int = i + 1
+                    if j < len(payloads):
+                        payload2 = payloads[j]
+                        if (
+                            payload.tg_op != payload2.tg_op
+                            or payload.table != payload2.table
+                        ):
+                            self.search_client.bulk(
+                                self.index,
+                                self._payloads(_payloads),
+                            )
+                            _payloads = []
+                    elif j == len(payloads):
+                        self.search_client.bulk(
+                            self.index, self._payloads(_payloads)
+                        )
+                        _payloads: list = []
+
+            txids: t.Set = set(map(lambda x: x.xmin, payloads))
+            # for truncate, tg_op txids is None so skip setting the checkpoint
+            if txids != set([None]):
+                self.checkpoint: int = min(min(txids), self.txid_current) - 1
 
     def pull(self, polling: bool = False) -> None:
         """Pull data from db."""
@@ -1516,30 +1596,37 @@ class Sync(Base, metaclass=Singleton):
         logical_slot_chunk_size: int = settings.LOGICAL_SLOT_CHUNK_SIZE
 
         logger.debug(f"pull txmin: {txmin} - txmax: {txmax}")
-        # forward pass sync
-        self.search_client.bulk(
-            self.index, self.sync(txmin=txmin, txmax=txmax)
-        )
-
-        # this is the max lsn we should go upto
-        upto_lsn: str = self.current_wal_lsn
-        try:
-            # now sync up to txmax to capture everything we may have missed
-            self.logical_slot_changes(
-                txmin=txmin,
-                txmax=txmax,
-                logical_slot_chunk_size=logical_slot_chunk_size,
-                upto_lsn=upto_lsn,
+        with _span(
+            "pgsync.pull",
+            resource="pgsync.pull",
+            index=self.index,
+            database=self.database,
+            txmin=txmin,
+            txmax=txmax,
+        ):
+            # forward pass sync
+            self.search_client.bulk(
+                self.index, self.sync(txmin=txmin, txmax=txmax)
             )
-        except Exception as e:
-            # if we are polling, we can just continue
-            if polling:
-                return
-            else:
-                raise
 
-        self.checkpoint: int = txmax or self.txid_current
-        self._truncate = True
+            # this is the max lsn we should go upto
+            upto_lsn: str = self.current_wal_lsn
+            try:
+                # now sync up to txmax to capture everything we may have missed
+                self.logical_slot_changes(
+                    txmin=txmin,
+                    txmax=txmax,
+                    logical_slot_chunk_size=logical_slot_chunk_size,
+                    upto_lsn=upto_lsn,
+                )
+            except Exception as e:
+                # if we are polling, we can just continue
+                if polling:
+                    return
+                raise
+            else:
+                self.checkpoint = txmax or self.txid_current
+                self._truncate = True
 
     @threaded
     @exception

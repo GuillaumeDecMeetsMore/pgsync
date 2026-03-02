@@ -2,10 +2,16 @@
 
 import json
 import logging
+import sys
 import typing as t
 
 from redis import Redis
 from redis.exceptions import ConnectionError
+
+try:
+    from ddtrace import tracer as _dd_tracer
+except ImportError:
+    _dd_tracer = None
 
 from .settings import (
     REDIS_READ_CHUNK_SIZE,
@@ -45,12 +51,24 @@ class RedisQueue(object):
         """Remove and return multiple items from the queue."""
         chunk_size = chunk_size or REDIS_READ_CHUNK_SIZE
         if self.qsize > 0:
-            pipeline = self.__db.pipeline()
-            pipeline.lrange(self.key, 0, chunk_size - 1)
-            pipeline.ltrim(self.key, chunk_size, -1)
-            items: t.List = pipeline.execute()
-            logger.debug(f"pop size: {len(items[0])}")
-            return list(map(lambda value: json.loads(value), items[0]))
+            span = None
+            if _dd_tracer:
+                span = _dd_tracer.trace(
+                    "pgsync.redis.pop", resource="pgsync.redis.pop"
+                )
+                span.set_tag("queue_key", self.key)
+                span.__enter__()
+            try:
+                pipeline = self.__db.pipeline()
+                pipeline.lrange(self.key, 0, chunk_size - 1)
+                pipeline.ltrim(self.key, chunk_size, -1)
+                items: t.List = pipeline.execute()
+                logger.debug(f"pop size: {len(items[0])}")
+                return list(map(lambda value: json.loads(value), items[0]))
+            finally:
+                if span:
+                    span.__exit__(*sys.exc_info())
+        return []
 
     def pop_visible_in_snapshot(
         self,
@@ -82,7 +100,21 @@ class RedisQueue(object):
 
     def push(self, items: t.List) -> None:
         """Push multiple items onto the queue."""
-        self.__db.rpush(self.key, *map(json.dumps, items))
+        if not items:
+            return
+        span = None
+        if _dd_tracer:
+            span = _dd_tracer.trace(
+                "pgsync.redis.push", resource="pgsync.redis.push"
+            )
+            span.set_tag("queue_key", self.key)
+            span.set_tag("item_count", len(items))
+            span.__enter__()
+        try:
+            self.__db.rpush(self.key, *map(json.dumps, items))
+        finally:
+            if span:
+                span.__exit__(*sys.exc_info())
 
     def delete(self) -> None:
         """Delete all items from the named queue."""

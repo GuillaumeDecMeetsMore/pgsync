@@ -3,6 +3,7 @@
 import logging
 import os
 import random
+import sys
 import threading
 import time
 import typing as t
@@ -11,6 +12,11 @@ from contextlib import contextmanager
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql  # noqa
 from sqlalchemy.orm import sessionmaker
+
+try:
+    from ddtrace import tracer as _dd_tracer
+except ImportError:
+    _dd_tracer = None
 
 from .constants import (
     BUILTIN_SCHEMAS,
@@ -698,22 +704,37 @@ class Base(object):
         To get ALL changes and data in existing replication slot:
         SELECT * FROM PG_LOGICAL_SLOT_GET_CHANGES('testdb', NULL, NULL)
         """
-        with self.advisory_lock(
-            slot_name, max_retries=None, retry_interval=0.1
-        ):
-            statement: sa.sql.Select = self._logical_slot_changes(
-                slot_name,
-                sa.func.PG_LOGICAL_SLOT_GET_CHANGES,
-                txmin=txmin,
-                txmax=txmax,
-                upto_lsn=upto_lsn,
-                upto_nchanges=upto_nchanges,
-                limit=limit,
-                offset=offset,
+        span = None
+        if _dd_tracer:
+            span = _dd_tracer.trace(
+                "pgsync.logical_slot", resource="pgsync.logical_slot.get_changes"
             )
-            self.execute(
-                statement, options=dict(stream_results=STREAM_RESULTS)
-            )
+            span.set_tag("slot_name", slot_name)
+            if limit is not None:
+                span.set_tag("limit", limit)
+            if offset is not None:
+                span.set_tag("offset", offset)
+            span.__enter__()
+        try:
+            with self.advisory_lock(
+                slot_name, max_retries=None, retry_interval=0.1
+            ):
+                statement: sa.sql.Select = self._logical_slot_changes(
+                    slot_name,
+                    sa.func.PG_LOGICAL_SLOT_GET_CHANGES,
+                    txmin=txmin,
+                    txmax=txmax,
+                    upto_lsn=upto_lsn,
+                    upto_nchanges=upto_nchanges,
+                    limit=limit,
+                    offset=offset,
+                )
+                self.execute(
+                    statement, options=dict(stream_results=STREAM_RESULTS)
+                )
+        finally:
+            if span:
+                span.__exit__(*sys.exc_info())
 
     def logical_slot_peek_changes(
         self,
@@ -729,20 +750,35 @@ class Base(object):
 
         SELECT * FROM PG_LOGICAL_SLOT_PEEK_CHANGES('testdb', NULL, 1)
         """
-        with self.advisory_lock(
-            slot_name, max_retries=None, retry_interval=0.1
-        ):
-            statement: sa.sql.Select = self._logical_slot_changes(
-                slot_name,
-                sa.func.PG_LOGICAL_SLOT_PEEK_CHANGES,
-                txmin=txmin,
-                txmax=txmax,
-                upto_lsn=upto_lsn,
-                upto_nchanges=upto_nchanges,
-                limit=limit,
-                offset=offset,
+        span = None
+        if _dd_tracer:
+            span = _dd_tracer.trace(
+                "pgsync.logical_slot", resource="pgsync.logical_slot.peek_changes"
             )
-            return self.fetchall(statement)
+            span.set_tag("slot_name", slot_name)
+            if limit is not None:
+                span.set_tag("limit", limit)
+            if offset is not None:
+                span.set_tag("offset", offset)
+            span.__enter__()
+        try:
+            with self.advisory_lock(
+                slot_name, max_retries=None, retry_interval=0.1
+            ):
+                statement: sa.sql.Select = self._logical_slot_changes(
+                    slot_name,
+                    sa.func.PG_LOGICAL_SLOT_PEEK_CHANGES,
+                    txmin=txmin,
+                    txmax=txmax,
+                    upto_lsn=upto_lsn,
+                    upto_nchanges=upto_nchanges,
+                    limit=limit,
+                    offset=offset,
+                )
+                return self.fetchall(statement)
+        finally:
+            if span:
+                span.__exit__(*sys.exc_info())
 
     def logical_slot_count_changes(
         self,
@@ -752,18 +788,30 @@ class Base(object):
         upto_lsn: t.Optional[str] = None,
         upto_nchanges: t.Optional[int] = None,
     ) -> int:
-        statement: sa.sql.Select = self._logical_slot_changes(
-            slot_name,
-            sa.func.PG_LOGICAL_SLOT_PEEK_CHANGES,
-            txmin=txmin,
-            txmax=txmax,
-            upto_lsn=upto_lsn,
-            upto_nchanges=upto_nchanges,
-        )
-        with self.engine.connect() as conn:
-            return conn.execute(
-                statement.with_only_columns(*[sa.func.COUNT()])
-            ).scalar()
+        span = None
+        if _dd_tracer:
+            span = _dd_tracer.trace(
+                "pgsync.logical_slot",
+                resource="pgsync.logical_slot.count_changes",
+            )
+            span.set_tag("slot_name", slot_name)
+            span.__enter__()
+        try:
+            statement: sa.sql.Select = self._logical_slot_changes(
+                slot_name,
+                sa.func.PG_LOGICAL_SLOT_PEEK_CHANGES,
+                txmin=txmin,
+                txmax=txmax,
+                upto_lsn=upto_lsn,
+                upto_nchanges=upto_nchanges,
+            )
+            with self.engine.connect() as conn:
+                return conn.execute(
+                    statement.with_only_columns(*[sa.func.COUNT()])
+                ).scalar()
+        finally:
+            if span:
+                span.__exit__(*sys.exc_info())
 
     # Views...
 

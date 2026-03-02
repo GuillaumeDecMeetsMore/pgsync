@@ -1,6 +1,14 @@
 #!/usr/bin/env python
 
 """PGSync runtime."""
+# Initialize Datadog tracer before pgsync imports that create connections.
+try:
+    import ddtrace.auto  # noqa: F401
+    from ddtrace import patch
+    patch(psycopg2=True, redis=True)
+except ImportError:
+    pass
+
 from pgsync import sync
 
 if __name__ == "__main__":

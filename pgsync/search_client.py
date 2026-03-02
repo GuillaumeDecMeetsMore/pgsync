@@ -1,6 +1,7 @@
 """PGSync SearchClient helper."""
 
 import logging
+import sys
 import typing as t
 from collections import defaultdict
 
@@ -11,6 +12,11 @@ import elasticsearch_dsl
 import opensearch_dsl
 import opensearchpy
 from requests_aws4auth import AWS4Auth
+
+try:
+    from ddtrace import tracer as _dd_tracer
+except ImportError:
+    _dd_tracer = None
 
 from . import settings
 from .constants import (
@@ -135,6 +141,14 @@ class SearchClient(object):
         )
         ignore_status = ignore_status or settings.ELASTICSEARCH_IGNORE_STATUS
 
+        span = None
+        if _dd_tracer:
+            span = _dd_tracer.trace(
+                "opensearch.bulk", resource="opensearch.bulk"
+            )
+            span.set_tag("index", index)
+            span.set_tag("chunk_size", chunk_size)
+            span.__enter__()
         try:
             self._bulk(
                 index,
@@ -155,6 +169,9 @@ class SearchClient(object):
             logger.exception(f"Exception {e}")
             if raise_on_exception or raise_on_error:
                 raise
+        finally:
+            if span:
+                span.__exit__(*sys.exc_info())
 
     def _bulk(
         self,
@@ -226,29 +243,41 @@ class SearchClient(object):
             'uid': ['a002', 'a009'],
         }
         """
-        fields = fields or {}
-        search = self.Search(using=self.__client, index=index)
-        # explicitly exclude all fields since we only need the doc _id
-        search = search.source(excludes=["*"])
-        for key, values in fields.items():
-            search = search.query(
-                self.Bool(
-                    filter=[
-                        self.Q("terms", **{f"{META}.{table}.{key}": values})
-                        | self.Q(
-                            "terms",
-                            **{f"{META}.{table}.{key}.keyword": values},
-                        )
-                    ]
-                )
+        span = None
+        if _dd_tracer:
+            span = _dd_tracer.trace(
+                "opensearch.search", resource="opensearch.search"
             )
+            span.set_tag("index", index)
+            span.set_tag("table", table)
+            span.__enter__()
         try:
-            for hit in search.scan():
-                yield hit.meta.id
-        except elasticsearch.exceptions.RequestError as e:
-            logger.warning(f"RequestError: {e}")
-            if "is out of range for a long" not in str(e):
-                raise
+            fields = fields or {}
+            search = self.Search(using=self.__client, index=index)
+            # explicitly exclude all fields since we only need the doc _id
+            search = search.source(excludes=["*"])
+            for key, values in fields.items():
+                search = search.query(
+                    self.Bool(
+                        filter=[
+                            self.Q("terms", **{f"{META}.{table}.{key}": values})
+                            | self.Q(
+                                "terms",
+                                **{f"{META}.{table}.{key}.keyword": values},
+                            )
+                        ]
+                    )
+                )
+            try:
+                for hit in search.scan():
+                    yield hit.meta.id
+            except elasticsearch.exceptions.RequestError as e:
+                logger.warning(f"RequestError: {e}")
+                if "is out of range for a long" not in str(e):
+                    raise
+        finally:
+            if span:
+                span.__exit__(*sys.exc_info())
 
     def search(self, index: str, body: dict) -> t.Any:
         """

@@ -2,6 +2,7 @@
 
 boto3
 click
+ddtrace
 elasticsearch
 elasticsearch-dsl
 environs
