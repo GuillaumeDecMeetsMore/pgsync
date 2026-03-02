@@ -1,0 +1,53 @@
+bin/pgsync
+  93c67abfffaf9331 4-11
+pgsync/search_client.py
+  a053f5997be0ac6a 17,19,145-146,247-248
+  93c67abfffaf9331 4,16,18,20,144,147-151,172-174,246,249,251-253,255-258,264,270-271,278-280
+pgsync/base.py
+  93c67abfffaf9331 6,16-19,707-710,712-724,731-737,753-756,758-770,777-781
+  a053f5997be0ac6a 791-799,811-814
+.env.sample
+  93c67abfffaf9331 130-137
+requirements/base.txt
+  93c67abfffaf9331 26-27
+pgsync/sync.py
+  93c67abfffaf9331 24-39,512-517,519-522,1195-1206,1208-1209,1211-1214,1216-1223,1230,1232-1233,1235,1237,1239-1241,1246-1247,1249,1255-1259,1261-1262,1264-1267,1357-1363,1386-1391,1536-1543,1576-1581,1599-1603,1605,1607-1609,1612-1617,1621-1628
+  a053f5997be0ac6a 1431-1436,1449-1454,1500-1505
+requirements/base.in
+  93c67abfffaf9331 5
+pgsync/redisqueue.py
+  93c67abfffaf9331 5,11-14,54-61,67-71,103-117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.7",
+  "base_commit_sha": "3ac0f1a6cc9524cd82fe02339971ddf2ee9e9c5b",
+  "prompts": {
+    "93c67abfffaf9331": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "dafaff65-bb17-40fd-bf49-85f4acb1e6c8",
+        "model": "default"
+      },
+      "human_author": "Guillaume Deconinck <deconinck.guillaume@meetsmore.com>",
+      "messages": [],
+      "total_additions": 389,
+      "total_deletions": 213,
+      "accepted_lines": 267,
+      "overriden_lines": 0
+    },
+    "a053f5997be0ac6a": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "73edc829-aca8-46f4-887e-cc708345acb7",
+        "model": "default"
+      },
+      "human_author": "Guillaume Deconinck <deconinck.guillaume@meetsmore.com>",
+      "messages": [],
+      "total_additions": 55,
+      "total_deletions": 21,
+      "accepted_lines": 37,
+      "overriden_lines": 0
+    }
+  }
+}
