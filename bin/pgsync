@@ -4,8 +4,8 @@
 # Initialize Datadog tracer before pgsync imports that create connections.
 try:
     import ddtrace.auto  # noqa: F401
-    from ddtrace import patch
-    patch(psycopg2=True, redis=True)
+    from ddtrace import patch_all
+    patch_all()
 except ImportError:
     pass
 
