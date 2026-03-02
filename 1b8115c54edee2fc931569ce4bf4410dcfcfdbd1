@@ -1,0 +1,25 @@
+bin/pgsync
+  a053f5997be0ac6a 7-8
+.env.sample
+  a053f5997be0ac6a 137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.7",
+  "base_commit_sha": "1b8115c54edee2fc931569ce4bf4410dcfcfdbd1",
+  "prompts": {
+    "a053f5997be0ac6a": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "73edc829-aca8-46f4-887e-cc708345acb7",
+        "model": "default"
+      },
+      "human_author": "Guillaume Deconinck <deconinck.guillaume@meetsmore.com>",
+      "messages": [],
+      "total_additions": 3,
+      "total_deletions": 3,
+      "accepted_lines": 3,
+      "overriden_lines": 0
+    }
+  }
+}
