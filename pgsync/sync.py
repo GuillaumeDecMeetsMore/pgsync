@@ -1359,6 +1359,7 @@ class Sync(Base, metaclass=Singleton):
                 resource="pgsync.poll_redis",
                 payload_count=len(payloads),
                 index=self.index,
+                iteration_type="consumer",
             ):
                 with self.lock:
                     self.count["redis"] += len(payloads)
@@ -1388,6 +1389,7 @@ class Sync(Base, metaclass=Singleton):
                 resource="pgsync.poll_redis",
                 payload_count=len(payloads),
                 index=self.index,
+                iteration_type="consumer",
             ):
                 self.count["redis"] += len(payloads)
                 await self.async_refresh_views()
@@ -1433,6 +1435,7 @@ class Sync(Base, metaclass=Singleton):
                         resource="pgsync.poll_db",
                         payload_count=len(payloads),
                         index=self.index,
+                        iteration_type="producer",
                     ):
                         self.redis.push(payloads)
                     payloads = []
@@ -1451,6 +1454,7 @@ class Sync(Base, metaclass=Singleton):
                         resource="pgsync.poll_db",
                         payload_count=len(payloads),
                         index=self.index,
+                        iteration_type="producer",
                     ):
                         self.redis.push(payloads)
                     payloads = []
@@ -1502,6 +1506,7 @@ class Sync(Base, metaclass=Singleton):
                         resource="pgsync.poll_db",
                         payload_count=1,
                         index=self.index,
+                        iteration_type="producer",
                     ):
                         self.redis.push([payload])
                     logger.debug(f"async_poll: {payload}")
@@ -1894,7 +1899,13 @@ def main(
                 config=config, s3_schema_url=s3_schema_url
             ):
                 sync: Sync = Sync(doc, verbose=verbose, **kwargs)
-                sync.analyze()
+                with _span(
+                    "pgsync.analyze",
+                    resource="pgsync.analyze",
+                    index=doc.get("index") or doc.get("database"),
+                    iteration_type="analyze",
+                ):
+                    sync.analyze()
 
         elif polling:
             # In polling mode, the app can run without replication slots or triggers.
@@ -1902,11 +1913,16 @@ def main(
             # It should be considered a workaround for running on a read-only cluster.
             kwargs["polling"] = True
             while True:
-                for doc in config_loader(
-                    config=config, s3_schema_url=s3_schema_url
+                with _span(
+                    "pgsync.polling.iteration",
+                    resource="pgsync.polling.iteration",
+                    iteration_type="polling",
                 ):
-                    sync: Sync = Sync(doc, verbose=verbose, **kwargs)
-                    sync.pull(polling=True)
+                    for doc in config_loader(
+                        config=config, s3_schema_url=s3_schema_url
+                    ):
+                        sync: Sync = Sync(doc, verbose=verbose, **kwargs)
+                        sync.pull(polling=True)
                 time.sleep(settings.POLL_INTERVAL)
 
         else:
