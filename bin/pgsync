@@ -3,9 +3,10 @@
 """PGSync runtime."""
 # Initialize Datadog tracer before pgsync imports that create connections.
 try:
-    import ddtrace.auto  # noqa: F401
-    from ddtrace import patch_all
-    patch_all()
+    import ddtrace.auto  # install instrumentation as early as possible
+    from ddtrace import patch
+    # Make sure we patch elasticsearch to use the Datadog tracer
+    patch(elasticsearch=True)
 except ImportError:
     pass
 
