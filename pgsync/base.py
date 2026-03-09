@@ -1200,9 +1200,22 @@ class Base(object):
             result = conn.execution_options(
                 stream_results=stream_results
             ).execute(statement.select())
-            for partition in result.partitions(chunk_size):
-                for keys, row, *primary_keys in partition:
-                    yield keys, row, primary_keys
+            for partition_index, partition in enumerate(result.partitions(chunk_size)):
+                span = None
+                if _dd_tracer:
+                    span = _dd_tracer.trace(
+                        "pgsync.fetchmany.partition",
+                        resource="pgsync.fetchmany.partition",
+                    )
+                    span.set_tag("chunk_size", chunk_size)
+                    span.set_tag("partition_index", partition_index)
+                    span.__enter__()
+                try:
+                    for keys, row, *primary_keys in partition:
+                        yield keys, row, primary_keys
+                finally:
+                    if span:
+                        span.__exit__(*sys.exc_info())
             result.close()
         self.engine.clear_compiled_cache()
 

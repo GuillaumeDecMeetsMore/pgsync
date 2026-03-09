@@ -1229,53 +1229,62 @@ class Sync(Base, metaclass=Singleton):
             if self.verbose:
                 compiled_query(node._subquery, "Query")
 
-            for i, (keys, row, primary_keys) in enumerate(
-                self.fetchmany(node._subquery)
+            # fetchmany() is called once per node; it returns a generator that yields
+            # row-by-row. DB work happens in chunks (partitions); each chunk gets
+            # its own span in base.fetchmany (pgsync.fetchmany.partition).
+            with _span(
+                "pgsync.fetchmany",
+                resource="pgsync.fetchmany",
+                index=self.index,
+                table=node.table,
             ):
-                row: dict = Transform.transform(row, self.nodes)
+                for i, (keys, row, primary_keys) in enumerate(
+                    self.fetchmany(node._subquery)
+                ):
+                    row: dict = Transform.transform(row, self.nodes)
 
-                row[META] = Transform.get_primary_keys(keys)
+                    row[META] = Transform.get_primary_keys(keys)
 
-                if node.is_root:
-                    primary_key_values: t.List[str] = list(map(str, primary_keys))
-                    primary_key_names: t.List[str] = [
-                        primary_key.name for primary_key in node.primary_keys
-                    ]
-                    # TODO: add support for composite pkeys
-                    row[META][node.table] = {
-                        primary_key_names[0]: [primary_key_values[0]],
+                    if node.is_root:
+                        primary_key_values: t.List[str] = list(map(str, primary_keys))
+                        primary_key_names: t.List[str] = [
+                            primary_key.name for primary_key in node.primary_keys
+                        ]
+                        # TODO: add support for composite pkeys
+                        row[META][node.table] = {
+                            primary_key_names[0]: [primary_key_values[0]],
+                        }
+
+                    if self.verbose:
+                        print(f"{(i+1)})")
+                        print(f"pkeys: {primary_keys}")
+                        pprint.pprint(row)
+                        print("-" * 10)
+
+                    doc: dict = {
+                        "_id": self.get_doc_id(primary_keys, node.table),
+                        "_index": self.index,
+                        "_source": row,
                     }
 
-                if self.verbose:
-                    print(f"{(i+1)})")
-                    print(f"pkeys: {primary_keys}")
-                    pprint.pprint(row)
-                    print("-" * 10)
+                    if self.routing:
+                        doc["_routing"] = row[self.routing]
 
-                doc: dict = {
-                    "_id": self.get_doc_id(primary_keys, node.table),
-                    "_index": self.index,
-                    "_source": row,
-                }
+                    if (
+                        self.search_client.major_version < 7
+                        and not self.search_client.is_opensearch
+                    ):
+                        doc["_type"] = "_doc"
 
-                if self.routing:
-                    doc["_routing"] = row[self.routing]
+                    if self._plugins:
+                        doc = next(self._plugins.transform([doc]))
+                        if not doc:
+                            continue
 
-                if (
-                    self.search_client.major_version < 7
-                    and not self.search_client.is_opensearch
-                ):
-                    doc["_type"] = "_doc"
+                    if self.pipeline:
+                        doc["pipeline"] = self.pipeline
 
-                if self._plugins:
-                    doc = next(self._plugins.transform([doc]))
-                    if not doc:
-                        continue
-
-                if self.pipeline:
-                    doc["pipeline"] = self.pipeline
-
-                yield doc
+                    yield doc
 
     @property
     def checkpoint(self) -> int:
@@ -1286,15 +1295,20 @@ class Sync(Base, metaclass=Singleton):
         :rtype: int
         """
         raw: t.Optional[str]
-        if settings.REDIS_CHECKPOINT:
-            raw = self.redis.get_meta(default={}).get("checkpoint")
-        else:
-            path: Path = Path(self.checkpoint_file)
-            raw = (
-                path.read_text(encoding="utf-8").split()[0]
-                if path.exists()
-                else None
-            )
+        with _span(
+            "pgsync.checkpoint.read",
+            resource="pgsync.checkpoint.read",
+            index=self.index,
+        ):
+            if settings.REDIS_CHECKPOINT:
+                raw = self.redis.get_meta(default={}).get("checkpoint")
+            else:
+                path: Path = Path(self.checkpoint_file)
+                raw = (
+                    path.read_text(encoding="utf-8").split()[0]
+                    if path.exists()
+                    else None
+                )
 
         if raw is None:
             return None
@@ -1318,12 +1332,17 @@ class Sync(Base, metaclass=Singleton):
         if value is None:
             raise TypeError("Cannot assign a None value to checkpoint")
 
-        if settings.REDIS_CHECKPOINT:
-            self.redis.set_meta({"checkpoint": value})
-        else:
-            Path(self.checkpoint_file).write_text(
-                f"{value}\n", encoding="utf-8"
-            )
+        with _span(
+            "pgsync.checkpoint.write",
+            resource="pgsync.checkpoint.write",
+            index=self.index,
+        ):
+            if settings.REDIS_CHECKPOINT:
+                self.redis.set_meta({"checkpoint": value})
+            else:
+                Path(self.checkpoint_file).write_text(
+                    f"{value}\n", encoding="utf-8"
+                )
 
         # Update in-memory cache last
         self._checkpoint = value
@@ -1522,7 +1541,14 @@ class Sync(Base, metaclass=Singleton):
         for node in self.tree.traverse_breadth_first():
             if node.table in self.views(node.schema):
                 if node.table in self._materialized_views(node.schema):
-                    self.refresh_view(node.table, node.schema)
+                    with _span(
+                        "pgsync.refresh_view",
+                        resource="pgsync.refresh_view",
+                        index=self.index,
+                        table=node.table,
+                        schema=node.schema,
+                    ):
+                        self.refresh_view(node.table, node.schema)
 
     def on_publish(self, payloads: t.List[Payload]) -> None:
         self._on_publish(payloads)
@@ -1650,7 +1676,13 @@ class Sync(Base, metaclass=Singleton):
     def _truncate_slots(self) -> None:
         if self._truncate:
             logger.debug(f"Truncating replication slot: {self.__name}")
-            self.logical_slot_get_changes(self.__name, upto_nchanges=None)
+            with _span(
+                "pgsync.truncate_slots",
+                resource="pgsync.truncate_slots",
+                index=self.index,
+                slot_name=self.__name,
+            ):
+                self.logical_slot_get_changes(self.__name, upto_nchanges=None)
 
     @threaded
     @exception

@@ -36,7 +36,9 @@ Each **trace** corresponds to one “unit of work” (one iteration / one batch)
 pgsync.pull                    ← root (one trace per schema doc)
 ├── pgsync.sync                 ← forward-pass: build queries, fetch rows, yield docs
 │   ├── pgsync.query_builder.build
-│   └── (DB fetch via SQLAlchemy/psycopg – may appear as postgres spans)
+│   ├── pgsync.fetchmany        ← per-node: full stream from PG, transform, yield
+│   │   └── pgsync.fetchmany.partition  ← one per DB chunk (QUERY_CHUNK_SIZE rows)
+│   └── (postgres spans from fetchmany)
 ├── opensearch.bulk             ← index the forward-pass docs
 ├── pgsync.logical_slot_changes ← replay WAL and index change events
 │   ├── pgsync.logical_slot (count_changes)
@@ -84,7 +86,8 @@ pgsync.poll_redis               ← root (iteration_type=consumer)
 ├── pgsync.on_publish            ← handle batch: build filters, call sync, bulk
 │   ├── pgsync.sync              ← per filter chunk (build query + fetch + yield)
 │   │   ├── pgsync.query_builder.build
-│   │   └── (postgres spans for fetchmany)
+│   │   ├── pgsync.fetchmany
+│   │   └── (postgres spans)
 │   ├── opensearch.bulk         ← one or more per batch
 │   └── (opensearch.search if primary-key lookups are needed)
 ```
@@ -147,6 +150,8 @@ pgsync.analyze                  ← root (iteration_type=analyze)
 | `pgsync.analyze`                 | Analyze mode               | Index analysis for one schema. Tag: `iteration_type=analyze`. |
 | `pgsync.sync`                    | Inside pull or on_publish  | Build queries, fetch rows from PG, transform to docs (generator). |
 | `pgsync.query_builder.build`     | Inside pgsync.sync          | Build SQL for one node (table) in the tree. |
+| `pgsync.fetchmany`               | Inside pgsync.sync          | Wraps the full consumption of the fetchmany generator (one per node; streaming fetch + transform). Tag: `table`. |
+| `pgsync.fetchmany.partition`     | base.py, inside fetchmany   | One per DB chunk: time to fetch one partition (up to `chunk_size` rows) from Postgres. Tags: `chunk_size`, `partition_index`. |
 | `pgsync.on_publish`              | Daemon consumer             | Handle one batch of Redis payloads: apply filters, call sync, bulk to OpenSearch. |
 | `pgsync.logical_slot_changes`    | Inside pull                 | Replay WAL: get changes from logical slot, group by (tg_op, table), bulk index. |
 | `pgsync.logical_slot`            | base.py                    | Resource: `get_changes` \| `peek_changes` \| `count_changes` – low-level WAL slot I/O. |
@@ -154,6 +159,10 @@ pgsync.analyze                  ← root (iteration_type=analyze)
 | `pgsync.redis.push`             | redisqueue.py              | Push items to Redis queue. |
 | `opensearch.bulk`               | search_client.py           | Bulk-index a chunk of documents. |
 | `opensearch.search`             | search_client.py           | Search (e.g. for primary-key resolution). |
+| `pgsync.refresh_view`           | sync.py                    | Postgres REFRESH MATERIALIZED VIEW (I/O). Tags: `table`, `schema`. |
+| `pgsync.checkpoint.read`        | sync.py                    | Read checkpoint from file or Redis (I/O). |
+| `pgsync.checkpoint.write`       | sync.py                    | Write checkpoint to file or Redis (I/O). |
+| `pgsync.truncate_slots`         | sync.py                    | Consume replication slot to advance (I/O; wraps logical_slot.get_changes). Tag: `slot_name`. |
 
 ---
 
