@@ -83,6 +83,60 @@ TX_BOUNDARY_RE = re.compile(r"^(BEGIN|COMMIT)\s+(\d+)", re.IGNORECASE)
 
 logger = logging.getLogger(__name__)
 
+# Max root-filter items per log line; above this we emit multiple log lines
+SYNC_SCOPE_LOG_CHUNK = 100
+# Max bytes per log message (avoid oversized logs); content is truncated if larger
+SYNC_SCOPE_LOG_MAX_BYTES = 8000
+# If sync duration exceeds this (secs), completion log includes a short ID sample for easy grep
+SYNC_SLOW_THRESHOLD_SECS = 5.0
+
+
+def _log_sync_scope(
+    log: logging.Logger,
+    *,
+    index: str,
+    table: str,
+    filter_size: int,
+    root_filters_list: list,
+    txmin: t.Optional[int],
+    txmax: t.Optional[int],
+    ctid: t.Optional[dict],
+) -> None:
+    """Log sync scope (root IDs, tx range, ctid) for correlation; chunk if > 100, truncate if too large."""
+    log.info(
+        "pgsync.sync scope index=%s table=%s filter_size=%s txmin=%s txmax=%s",
+        index,
+        table,
+        filter_size,
+        txmin,
+        txmax,
+    )
+    if root_filters_list:
+        if len(root_filters_list) <= SYNC_SCOPE_LOG_CHUNK:
+            chunks_to_log = [(0, len(root_filters_list) - 1, root_filters_list)]
+        else:
+            chunks_to_log = []
+            for start in range(0, len(root_filters_list), SYNC_SCOPE_LOG_CHUNK):
+                end_idx = min(start + SYNC_SCOPE_LOG_CHUNK, len(root_filters_list))
+                chunk = root_filters_list[start:end_idx]
+                chunks_to_log.append((start, end_idx - 1, chunk))
+        for start, end, chunk in chunks_to_log:
+            body = str(chunk)
+            if len(body.encode("utf-8")) > SYNC_SCOPE_LOG_MAX_BYTES:
+                body = body[: SYNC_SCOPE_LOG_MAX_BYTES - 80] + " ... (truncated)"
+            log.info(
+                "pgsync.sync root_filters index=%s [%s-%s]: %s",
+                index,
+                start,
+                end,
+                body,
+            )
+    if ctid is not None:
+        ctid_str = str(ctid)
+        if len(ctid_str.encode("utf-8")) > SYNC_SCOPE_LOG_MAX_BYTES:
+            ctid_str = ctid_str[: SYNC_SCOPE_LOG_MAX_BYTES - 40] + " ... (truncated)"
+        log.info("pgsync.sync ctid index=%s: %s", index, ctid_str)
+
 
 class Sync(Base, metaclass=Singleton):
     """Main application class for Sync."""
@@ -1198,29 +1252,33 @@ class Sync(Base, metaclass=Singleton):
             if filters and self.tree.root
             else 0
         )
-        # Sample of root-table filter IDs for trace correlation (first 5, truncated)
-        root_filter_sample = None
-        if filters and self.tree.root:
-            root_filters = filters.get(self.tree.root.table, [])[:5]
-            if root_filters:
-                sample = str(root_filters)
-                root_filter_sample = (
-                    sample[:400] + "..." if len(sample) > 400 else sample
-                )
+        root_filters_list = (
+            filters.get(self.tree.root.table, []) if filters and self.tree.root else []
+        )
         with _span(
             "pgsync.sync",
             resource="pgsync.sync",
             index=self.index,
             table=root_table,
             filter_size=filter_size,
-            root_filter_sample=root_filter_sample,
-            txmin=txmin,
-            txmax=txmax,
-            ctid=str(ctid)[:200] if ctid else None,
         ):
+            # Log sync scope for correlation; chunk if > 100 items
+            _log_sync_scope(
+                logger,
+                index=self.index,
+                table=root_table,
+                filter_size=filter_size,
+                root_filters_list=root_filters_list,
+                txmin=txmin,
+                txmax=txmax,
+                ctid=ctid,
+            )
+            _sync_start = time.monotonic()
             self.query_builder.isouter = True
             self.query_builder.from_obj = None
 
+            # Post-order: children first (e.g. Contact, Address), then root (Client).
+            # We only build the query tree here; a single query is executed below (root only).
             for node in self.tree.traverse_post_order():
                 node._subquery = None
                 node._filters = []
@@ -1298,6 +1356,21 @@ class Sync(Base, metaclass=Singleton):
                         doc["pipeline"] = self.pipeline
 
                     yield doc
+
+            _sync_elapsed = time.monotonic() - _sync_start
+            # For slow syncs, include a short ID sample so slow root IDs are visible in one line
+            extra = ""
+            if _sync_elapsed >= SYNC_SLOW_THRESHOLD_SECS and root_filters_list:
+                sample = root_filters_list[:3]
+                extra = " root_ids_sample=%s" % (sample,)
+            logger.info(
+                "pgsync.sync completed index=%s table=%s filter_size=%s duration_secs=%.3f%s",
+                self.index,
+                root_table,
+                filter_size,
+                _sync_elapsed,
+                extra,
+            )
 
     @property
     def checkpoint(self) -> int:
