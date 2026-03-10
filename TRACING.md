@@ -148,7 +148,7 @@ pgsync.analyze                  ← root (iteration_type=analyze)
 | `pgsync.poll_redis`              | Daemon consumer            | One batch of payloads popped from Redis and processed. Tag: `iteration_type=consumer`. |
 | `pgsync.polling.iteration`       | Polling mode               | One wake-up: pull all schema docs. Tag: `iteration_type=polling`. |
 | `pgsync.analyze`                 | Analyze mode               | Index analysis for one schema. Tag: `iteration_type=analyze`. |
-| `pgsync.sync`                    | Inside pull or on_publish  | Build queries, fetch rows from PG, transform to docs (generator). |
+| `pgsync.sync`                    | Inside pull or on_publish  | Build queries, fetch rows from PG, transform to docs (generator). Tags: `table`, `filter_size`, `root_filter_sample` (first 5 root IDs), `txmin`, `txmax`, `ctid` when set. |
 | `pgsync.query_builder.build`     | Inside pgsync.sync          | Build SQL for one node (table) in the tree. |
 | `pgsync.fetchmany`               | Inside pgsync.sync          | Wraps the full consumption of the fetchmany generator (one per node; streaming fetch + transform). Tag: `table`. |
 | `pgsync.fetchmany.partition`     | base.py, inside fetchmany   | One per DB chunk: time to fetch one partition (up to `chunk_size` rows) from Postgres. Tags: `chunk_size`, `partition_index`. |
