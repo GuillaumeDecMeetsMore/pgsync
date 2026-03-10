@@ -1,0 +1,25 @@
+pgsync/sync.py
+  81f090735c3401d8 86-139,1255-1256,1265-1276,1280-1281,1360-1374
+TRACING.md
+  81f090735c3401d8 151
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.9",
+  "base_commit_sha": "6f3e5c61a94d51024ca77f1b10b1700e10cd98d0",
+  "prompts": {
+    "81f090735c3401d8": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "1b2eabdb-b914-4028-971d-cdef105c2ff6",
+        "model": "default"
+      },
+      "human_author": "Guillaume Deconinck <deconinck.guillaume@meetsmore.com>",
+      "messages": [],
+      "total_additions": 121,
+      "total_deletions": 48,
+      "accepted_lines": 86,
+      "overriden_lines": 0
+    }
+  }
+}
