@@ -1198,25 +1198,12 @@ class Sync(Base, metaclass=Singleton):
             if filters and self.tree.root
             else 0
         )
-        # Sample of root-table filter IDs for trace correlation (first 5, truncated)
-        root_filter_sample = None
-        if filters and self.tree.root:
-            root_filters = filters.get(self.tree.root.table, [])[:5]
-            if root_filters:
-                sample = str(root_filters)
-                root_filter_sample = (
-                    sample[:400] + "..." if len(sample) > 400 else sample
-                )
         with _span(
             "pgsync.sync",
             resource="pgsync.sync",
             index=self.index,
             table=root_table,
             filter_size=filter_size,
-            root_filter_sample=root_filter_sample,
-            txmin=txmin,
-            txmax=txmax,
-            ctid=str(ctid)[:200] if ctid else None,
         ):
             self.query_builder.isouter = True
             self.query_builder.from_obj = None
