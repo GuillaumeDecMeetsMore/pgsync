@@ -82,21 +82,78 @@ class RedisQueue(object):
         that are visible in the current PostgreSQL snapshot.
         """
         chunk_size = chunk_size or REDIS_READ_CHUNK_SIZE
-        items: t.List = self.__db.lrange(self.key, 0, chunk_size - 1)
-        if not items:
-            return []
-        payloads = [json.loads(i) for i in items]
-        visible_map: dict = pg_visible_in_snapshot()(
-            [payload["xmin"] for payload in payloads]
-        )
-        visible: t.List[dict] = []
-        for item, payload in zip(items, payloads):
-            if visible_map.get(payload["xmin"]):
-                # Claim atomically
-                removed = self.__db.lrem(self.key, 1, item)
-                if removed:
-                    visible.append(payload)
-        return visible
+        span = None
+        if _dd_tracer:
+            span = _dd_tracer.trace(
+                "pgsync.redis.pop_visible",
+                resource="pgsync.redis.pop_visible",
+            )
+            span.set_tag("queue_key", self.key)
+            span.set_tag("chunk_size", chunk_size)
+            span.__enter__()
+        try:
+            items: t.List = self.__db.lrange(self.key, 0, chunk_size - 1)
+            if not items:
+                if span:
+                    span.set_tag("peeked_count", 0)
+                    span.set_tag("visible_count", 0)
+                    span.set_tag("lrem_count", 0)
+                return []
+            payloads = [json.loads(i) for i in items]
+
+            if span:
+                span.set_tag("peeked_count", len(items))
+
+            # Check visibility against PG snapshot
+            vis_span = None
+            if _dd_tracer:
+                vis_span = _dd_tracer.trace(
+                    "pgsync.redis.pg_visible_check",
+                    resource="pgsync.redis.pg_visible_check",
+                )
+                vis_span.set_tag("xmin_count", len(payloads))
+                vis_span.__enter__()
+            try:
+                visible_map: dict = pg_visible_in_snapshot()(
+                    [payload["xmin"] for payload in payloads]
+                )
+            finally:
+                if vis_span:
+                    vis_span.__exit__(*sys.exc_info())
+
+            visible: t.List[dict] = []
+            lrem_count = 0
+
+            # lrem loop — O(N) per call, this is the known bottleneck
+            lrem_span = None
+            if _dd_tracer:
+                lrem_span = _dd_tracer.trace(
+                    "pgsync.redis.lrem_loop",
+                    resource="pgsync.redis.lrem_loop",
+                )
+                lrem_span.set_tag("queue_key", self.key)
+                lrem_span.__enter__()
+            try:
+                for item, payload in zip(items, payloads):
+                    if visible_map.get(payload["xmin"]):
+                        # Claim atomically
+                        removed = self.__db.lrem(self.key, 1, item)
+                        lrem_count += 1
+                        if removed:
+                            visible.append(payload)
+            finally:
+                if lrem_span:
+                    lrem_span.set_tag("lrem_count", lrem_count)
+                    lrem_span.set_tag("visible_count", len(visible))
+                    lrem_span.__exit__(*sys.exc_info())
+
+            if span:
+                span.set_tag("visible_count", len(visible))
+                span.set_tag("lrem_count", lrem_count)
+            return visible
+        finally:
+            if span:
+                span.__exit__(*sys.exc_info())
 
     def push(self, items: t.List) -> None:
         """Push multiple items onto the queue."""

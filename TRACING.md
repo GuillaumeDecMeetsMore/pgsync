@@ -173,7 +173,10 @@ pgsync.analyze                  ← root (iteration_type=analyze)
 | `pgsync.plugin_transform`       | Inside pgsync.sync (fetchmany loop) | Per-doc plugin transformation (e.g. JobCustomFields, Clients). Tags: `index`, `doc_id`. |
 | `pgsync.logical_slot_changes`    | Inside pull                 | Replay WAL: get changes from logical slot, group by (tg_op, table), bulk index. |
 | `pgsync.logical_slot`            | base.py                    | Resource: `get_changes` \| `peek_changes` \| `count_changes` – low-level WAL slot I/O. |
-| `pgsync.redis.pop`               | redisqueue.py              | Pop items from Redis queue. |
+| `pgsync.redis.pop`               | redisqueue.py              | Pop items from Redis queue (simple LRANGE+LTRIM path). |
+| `pgsync.redis.pop_visible`      | redisqueue.py              | Pop items visible in PG snapshot (read-only consumer path, uses lrem). Tags: `peeked_count`, `visible_count`, `lrem_count`. |
+| `pgsync.redis.pg_visible_check` | redisqueue.py              | PG snapshot visibility query for xmins. Tag: `xmin_count`. |
+| `pgsync.redis.lrem_loop`        | redisqueue.py              | O(N) lrem loop — known bottleneck when queue is large. Tags: `lrem_count`, `visible_count`. |
 | `pgsync.redis.push`             | redisqueue.py              | Push items to Redis queue. |
 | `opensearch.bulk`               | search_client.py           | Bulk-index a chunk of documents. |
 | `opensearch.search`             | search_client.py           | Search (e.g. for primary-key resolution). |
