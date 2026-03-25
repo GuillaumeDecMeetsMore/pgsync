@@ -548,6 +548,21 @@ class Sync(Base, metaclass=Singleton):
         - Greedily chunks so no per-field 'terms' list exceeds max_terms_count
         - Issues one search per chunk and de-dupes doc_ids
         """
+        with _span(
+            "pgsync.root_pk_resolver",
+            resource="pgsync.root_pk_resolver",
+            index=self.index,
+            table=node.table,
+            payload_count=len(payloads),
+        ):
+            return self.__root_primary_key_resolver(node, payloads, filters)
+
+    def __root_primary_key_resolver(
+        self,
+        node: Node,
+        payloads: t.Sequence[Payload],
+        filters: list,
+    ) -> list:
         if not payloads:
             return filters
 
@@ -644,6 +659,24 @@ class Sync(Base, metaclass=Singleton):
         Splits large value sets into chunks so that each field's terms list
         is <= max_terms_count (defaults to 65536).
         """
+        with _span(
+            "pgsync.root_fk_resolver",
+            resource="pgsync.root_fk_resolver",
+            index=self.index,
+            table=node.table,
+            payload_count=len(payloads),
+        ):
+            return self.__root_foreign_key_resolver(
+                node, payloads, foreign_keys, filters
+            )
+
+    def __root_foreign_key_resolver(
+        self,
+        node: Node,
+        payloads: t.Sequence[Payload],
+        foreign_keys: dict,
+        filters: list,
+    ) -> list:
         if not payloads:
             return filters
 
@@ -716,6 +749,21 @@ class Sync(Base, metaclass=Singleton):
         For each payload, if it carries a foreign key to the root, append a
         {remote_field: value} filter. Deduplicates to avoid redundant entries.
         """
+        with _span(
+            "pgsync.through_node_resolver",
+            resource="pgsync.through_node_resolver",
+            index=self.index,
+            table=node.table,
+            payload_count=len(payloads),
+        ):
+            return self.__through_node_resolver(node, payloads, filters)
+
+    def __through_node_resolver(
+        self,
+        node: Node,
+        payloads: t.Sequence[Payload],
+        filters: list,
+    ) -> list:
         if not payloads:
             return filters
 
@@ -745,6 +793,20 @@ class Sync(Base, metaclass=Singleton):
         return filters
 
     def _insert_op(
+        self, node: Node, filters: dict, payloads: t.List[Payload]
+    ) -> dict:
+        with _span(
+            "pgsync.insert_op",
+            resource="pgsync.insert_op",
+            index=self.index,
+            table=node.table,
+            is_through=node.is_through,
+            is_root=node.is_root,
+            payload_count=len(payloads),
+        ):
+            return self.__insert_op(node, filters, payloads)
+
+    def __insert_op(
         self, node: Node, filters: dict, payloads: t.List[Payload]
     ) -> dict:
         if node.is_through:
@@ -860,6 +922,22 @@ class Sync(Base, metaclass=Singleton):
         filters: dict,
         payloads: t.List[dict],
     ) -> dict:
+        with _span(
+            "pgsync.update_op",
+            resource="pgsync.update_op",
+            index=self.index,
+            table=node.table,
+            is_root=node.is_root,
+            payload_count=len(payloads),
+        ):
+            return self.__update_op(node, filters, payloads)
+
+    def __update_op(
+        self,
+        node: Node,
+        filters: dict,
+        payloads: t.List[dict],
+    ) -> dict:
         if node.is_root:
             # Here, we are performing two operations:
             # 1) Build a filter to sync the updated record(s)
@@ -941,6 +1019,19 @@ class Sync(Base, metaclass=Singleton):
     def _delete_op(
         self, node: Node, filters: dict, payloads: t.List[dict]
     ) -> dict:
+        with _span(
+            "pgsync.delete_op",
+            resource="pgsync.delete_op",
+            index=self.index,
+            table=node.table,
+            is_root=node.is_root,
+            payload_count=len(payloads),
+        ):
+            return self.__delete_op(node, filters, payloads)
+
+    def __delete_op(
+        self, node: Node, filters: dict, payloads: t.List[dict]
+    ) -> dict:
         # when deleting a root node, just delete the doc in
         # Elasticsearch/OpenSearch
         if node.is_root:
@@ -993,6 +1084,16 @@ class Sync(Base, metaclass=Singleton):
         return filters
 
     def _truncate_op(self, node: Node, filters: dict) -> dict:
+        with _span(
+            "pgsync.truncate_op",
+            resource="pgsync.truncate_op",
+            index=self.index,
+            table=node.table,
+            is_root=node.is_root,
+        ):
+            return self.__truncate_op(node, filters)
+
+    def __truncate_op(self, node: Node, filters: dict) -> dict:
         if node.is_root:
             docs: list = []
             for doc_id in self.search_client._search(self.index, node.table):
@@ -1094,29 +1195,39 @@ class Sync(Base, metaclass=Singleton):
         if not node.is_root:
             filters[node.parent.table] = []
 
-        if payload.tg_op == INSERT:
-            filters = self._insert_op(
-                node,
-                filters,
-                payloads,
-            )
+        with _span(
+            "pgsync.resolve_filters",
+            resource="pgsync.resolve_filters",
+            index=self.index,
+            table=node.table,
+            tg_op=payload.tg_op,
+            is_root=node.is_root,
+            is_through=node.is_through,
+            payload_count=len(payloads),
+        ):
+            if payload.tg_op == INSERT:
+                filters = self._insert_op(
+                    node,
+                    filters,
+                    payloads,
+                )
 
-        if payload.tg_op == UPDATE:
-            filters = self._update_op(
-                node,
-                filters,
-                payloads,
-            )
+            if payload.tg_op == UPDATE:
+                filters = self._update_op(
+                    node,
+                    filters,
+                    payloads,
+                )
 
-        if payload.tg_op == DELETE:
-            filters = self._delete_op(
-                node,
-                filters,
-                payloads,
-            )
+            if payload.tg_op == DELETE:
+                filters = self._delete_op(
+                    node,
+                    filters,
+                    payloads,
+                )
 
-        if payload.tg_op == TRUNCATE:
-            filters = self._truncate_op(node, filters)
+            if payload.tg_op == TRUNCATE:
+                filters = self._truncate_op(node, filters)
 
         # If there are no filters, then don't execute the sync query
         # otherwise we would end up performing a full query
@@ -1277,7 +1388,13 @@ class Sync(Base, metaclass=Singleton):
                         doc["_type"] = "_doc"
 
                     if self._plugins:
-                        doc = next(self._plugins.transform([doc]))
+                        with _span(
+                            "pgsync.plugin_transform",
+                            resource="pgsync.plugin_transform",
+                            index=self.index,
+                            doc_id=doc.get("_id", ""),
+                        ):
+                            doc = next(self._plugins.transform([doc]))
                         if not doc:
                             continue
 
