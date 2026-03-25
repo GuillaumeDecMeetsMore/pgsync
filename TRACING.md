@@ -84,12 +84,21 @@ pgsync.poll_db                  ← root (iteration_type=producer)
 pgsync.poll_redis               ← root (iteration_type=consumer)
 ├── (pgsync.redis.pop may appear as child if instrumentation order allows)
 ├── pgsync.on_publish            ← handle batch: build filters, call sync, bulk
+│   ├── pgsync.resolve_filters   ← per (tg_op, table) group: build filter dict
+│   │   ├── pgsync.insert_op / pgsync.update_op / pgsync.delete_op
+│   │   │   ├── pgsync.root_pk_resolver    ← batched ES search for root doc IDs
+│   │   │   │   └── opensearch.search
+│   │   │   ├── pgsync.root_fk_resolver    ← batched ES search by foreign keys
+│   │   │   │   └── opensearch.search
+│   │   │   └── pgsync.through_node_resolver  ← through-table FK resolution
+│   │   └── (or pgsync.truncate_op for TRUNCATE)
 │   ├── pgsync.sync              ← per filter chunk (build query + fetch + yield)
 │   │   ├── pgsync.query_builder.build
 │   │   ├── pgsync.fetchmany
+│   │   │   ├── pgsync.fetchmany.partition  ← DB chunk fetch
+│   │   │   └── pgsync.plugin_transform     ← per-doc plugin (if plugins configured)
 │   │   └── (postgres spans)
-│   ├── opensearch.bulk         ← one or more per batch
-│   └── (opensearch.search if primary-key lookups are needed)
+│   └── opensearch.bulk         ← one or more per batch
 ```
 
 **Useful tags:** On `pgsync.poll_redis`: `index`, `payload_count`, `iteration_type=consumer`. On `pgsync.on_publish`: `tg_ops`, `tables`, `payload_count`.
@@ -153,6 +162,15 @@ pgsync.analyze                  ← root (iteration_type=analyze)
 | `pgsync.fetchmany`               | Inside pgsync.sync          | Wraps the full consumption of the fetchmany generator (one per node; streaming fetch + transform). Tag: `table`. |
 | `pgsync.fetchmany.partition`     | base.py, inside fetchmany   | One per DB chunk: time to fetch one partition (up to `chunk_size` rows) from Postgres. Tags: `chunk_size`, `partition_index`. |
 | `pgsync.on_publish`              | Daemon consumer             | Handle one batch of Redis payloads: apply filters, call sync, bulk to OpenSearch. |
+| `pgsync.resolve_filters`        | Inside _payloads (consumer) | Wraps all filter resolution for one (tg_op, table) group. Tags: `table`, `tg_op`, `is_root`, `is_through`, `payload_count`. |
+| `pgsync.insert_op`              | Inside resolve_filters      | INSERT operation: resolve through-table and FK filters. Tags: `table`, `is_through`, `is_root`, `payload_count`. |
+| `pgsync.update_op`              | Inside resolve_filters      | UPDATE operation: resolve PK and FK filters. Tags: `table`, `is_root`, `payload_count`. |
+| `pgsync.delete_op`              | Inside resolve_filters      | DELETE operation: resolve PK filters or delete root docs. Tags: `table`, `is_root`, `payload_count`. |
+| `pgsync.truncate_op`            | Inside resolve_filters      | TRUNCATE operation: search and delete all matching docs. Tags: `table`, `is_root`. |
+| `pgsync.root_pk_resolver`       | Inside *_op spans           | Batched ES search to find root doc IDs by child primary keys. Tags: `table`, `payload_count`. |
+| `pgsync.root_fk_resolver`       | Inside *_op spans           | Batched ES search to find root doc IDs by child foreign keys. Tags: `table`, `payload_count`. |
+| `pgsync.through_node_resolver`  | Inside insert_op            | Resolve through-table direct references to root. Tags: `table`, `payload_count`. |
+| `pgsync.plugin_transform`       | Inside pgsync.sync (fetchmany loop) | Per-doc plugin transformation (e.g. JobCustomFields, Clients). Tags: `index`, `doc_id`. |
 | `pgsync.logical_slot_changes`    | Inside pull                 | Replay WAL: get changes from logical slot, group by (tg_op, table), bulk index. |
 | `pgsync.logical_slot`            | base.py                    | Resource: `get_changes` \| `peek_changes` \| `count_changes` – low-level WAL slot I/O. |
 | `pgsync.redis.pop`               | redisqueue.py              | Pop items from Redis queue. |
