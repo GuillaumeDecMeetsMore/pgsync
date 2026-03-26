@@ -173,6 +173,30 @@ class SearchClient(object):
             if span:
                 span.__exit__(*sys.exc_info())
 
+    @staticmethod
+    def _instrumented_actions(actions, index):
+        """Wrap actions generator to measure time between pulls."""
+        import time as _time
+        last_yield_time = None
+        doc_count = 0
+        for doc in actions:
+            now = _time.monotonic()
+            if last_yield_time is not None:
+                gap = now - last_yield_time
+                if _dd_tracer and gap > 0.1:
+                    # Only trace gaps > 100ms to avoid span flood
+                    span = _dd_tracer.trace(
+                        "pgsync.bulk_consumer_gap",
+                        resource="pgsync.bulk_consumer_gap",
+                    )
+                    span.set_tag("gap_seconds", round(gap, 3))
+                    span.set_tag("doc_index", doc_count)
+                    span.set_tag("index", index)
+                    span.finish()
+            doc_count += 1
+            yield doc
+            last_yield_time = _time.monotonic()
+
     def _bulk(
         self,
         index: str,
@@ -193,7 +217,7 @@ class SearchClient(object):
         if settings.ELASTICSEARCH_STREAMING_BULK:
             for ok, info in self.streaming_bulk(
                 self.__client,
-                actions,
+                self._instrumented_actions(actions, index),
                 index=index,
                 chunk_size=chunk_size,
                 max_chunk_bytes=max_chunk_bytes,

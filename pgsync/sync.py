@@ -1348,44 +1348,51 @@ class Sync(Base, metaclass=Singleton):
                 resource="pgsync.fetchmany",
                 index=self.index,
                 table=node.table,
-            ):
+            ) as fetchmany_span:
+                row_count = 0
                 for i, (keys, row, primary_keys) in enumerate(
                     self.fetchmany(node._subquery)
                 ):
-                    row: dict = Transform.transform(row, self.nodes)
+                    row_count += 1
 
-                    row[META] = Transform.get_primary_keys(keys)
+                    with _span(
+                        "pgsync.row_transform",
+                        resource="pgsync.row_transform",
+                    ):
+                        row: dict = Transform.transform(row, self.nodes)
 
-                    if node.is_root:
-                        primary_key_values: t.List[str] = list(map(str, primary_keys))
-                        primary_key_names: t.List[str] = [
-                            primary_key.name for primary_key in node.primary_keys
-                        ]
-                        # TODO: add support for composite pkeys
-                        row[META][node.table] = {
-                            primary_key_names[0]: [primary_key_values[0]],
+                        row[META] = Transform.get_primary_keys(keys)
+
+                        if node.is_root:
+                            primary_key_values: t.List[str] = list(map(str, primary_keys))
+                            primary_key_names: t.List[str] = [
+                                primary_key.name for primary_key in node.primary_keys
+                            ]
+                            # TODO: add support for composite pkeys
+                            row[META][node.table] = {
+                                primary_key_names[0]: [primary_key_values[0]],
+                            }
+
+                        if self.verbose:
+                            print(f"{(i+1)})")
+                            print(f"pkeys: {primary_keys}")
+                            pprint.pprint(row)
+                            print("-" * 10)
+
+                        doc: dict = {
+                            "_id": self.get_doc_id(primary_keys, node.table),
+                            "_index": self.index,
+                            "_source": row,
                         }
 
-                    if self.verbose:
-                        print(f"{(i+1)})")
-                        print(f"pkeys: {primary_keys}")
-                        pprint.pprint(row)
-                        print("-" * 10)
+                        if self.routing:
+                            doc["_routing"] = row[self.routing]
 
-                    doc: dict = {
-                        "_id": self.get_doc_id(primary_keys, node.table),
-                        "_index": self.index,
-                        "_source": row,
-                    }
-
-                    if self.routing:
-                        doc["_routing"] = row[self.routing]
-
-                    if (
-                        self.search_client.major_version < 7
-                        and not self.search_client.is_opensearch
-                    ):
-                        doc["_type"] = "_doc"
+                        if (
+                            self.search_client.major_version < 7
+                            and not self.search_client.is_opensearch
+                        ):
+                            doc["_type"] = "_doc"
 
                     if self._plugins:
                         with _span(
@@ -1401,7 +1408,14 @@ class Sync(Base, metaclass=Singleton):
                     if self.pipeline:
                         doc["pipeline"] = self.pipeline
 
-                    yield doc
+                    with _span(
+                        "pgsync.yield_wait",
+                        resource="pgsync.yield_wait",
+                    ):
+                        yield doc
+
+                if fetchmany_span is not None and hasattr(fetchmany_span, 'set_tag'):
+                    fetchmany_span.set_tag("row_count", row_count)
 
     @property
     def checkpoint(self) -> int:
