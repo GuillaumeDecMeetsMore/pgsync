@@ -1196,11 +1196,52 @@ class Base(object):
     ):
         chunk_size = chunk_size or QUERY_CHUNK_SIZE
         stream_results = stream_results or STREAM_RESULTS
-        with self.engine.connect() as conn:
-            result = conn.execution_options(
-                stream_results=stream_results
-            ).execute(statement.select())
+
+        conn_span = None
+        if _dd_tracer:
+            conn_span = _dd_tracer.trace(
+                "pgsync.fetchmany.connect",
+                resource="pgsync.fetchmany.connect",
+            )
+            conn_span.__enter__()
+        try:
+            conn_ctx = self.engine.connect()
+            conn = conn_ctx.__enter__()
+        finally:
+            if conn_span:
+                conn_span.__exit__(*sys.exc_info())
+
+        try:
+            exec_span = None
+            if _dd_tracer:
+                exec_span = _dd_tracer.trace(
+                    "pgsync.fetchmany.execute",
+                    resource="pgsync.fetchmany.execute",
+                )
+                exec_span.set_tag("stream_results", stream_results)
+                exec_span.__enter__()
+            try:
+                result = conn.execution_options(
+                    stream_results=stream_results
+                ).execute(statement.select())
+            finally:
+                if exec_span:
+                    exec_span.__exit__(*sys.exc_info())
+
             for partition_index, partition in enumerate(result.partitions(chunk_size)):
+                fetch_span = None
+                if _dd_tracer:
+                    fetch_span = _dd_tracer.trace(
+                        "pgsync.fetchmany.partition_fetch",
+                        resource="pgsync.fetchmany.partition_fetch",
+                    )
+                    fetch_span.set_tag("chunk_size", chunk_size)
+                    fetch_span.set_tag("partition_index", partition_index)
+                    fetch_span.__enter__()
+                # partition data is already fetched at this point
+                if fetch_span:
+                    fetch_span.__exit__(None, None, None)
+
                 span = None
                 if _dd_tracer:
                     span = _dd_tracer.trace(
@@ -1216,8 +1257,22 @@ class Base(object):
                 finally:
                     if span:
                         span.__exit__(*sys.exc_info())
-            result.close()
-        self.engine.clear_compiled_cache()
+
+            close_span = None
+            if _dd_tracer:
+                close_span = _dd_tracer.trace(
+                    "pgsync.fetchmany.result_close",
+                    resource="pgsync.fetchmany.result_close",
+                )
+                close_span.__enter__()
+            try:
+                result.close()
+            finally:
+                if close_span:
+                    close_span.__exit__(*sys.exc_info())
+        finally:
+            conn_ctx.__exit__(None, None, None)
+            self.engine.clear_compiled_cache()
 
     def fetchcount(self, statement: sa.sql.Subquery) -> int:
         with self.engine.connect() as conn:
