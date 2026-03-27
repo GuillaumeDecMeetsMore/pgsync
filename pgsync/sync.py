@@ -21,6 +21,24 @@ import sqlparse
 from psycopg2 import OperationalError
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
+try:
+    from ddtrace import tracer
+except ImportError:
+    tracer = None
+
+
+from contextlib import nullcontext as _nullcontext
+
+def _span(name: str, resource: str = None, **tags):
+    """Return a context manager that creates a Datadog span if tracer is available."""
+    if tracer is None:
+        return _nullcontext()
+    s = tracer.trace(name, resource=resource or name)
+    for k, v in tags.items():
+        if v is not None:
+            s.set_tag(k, str(v) if not isinstance(v, (int, float, bool)) else v)
+    return s
+
 from . import __version__, settings
 from .base import Base, Payload
 from .constants import (
@@ -492,16 +510,23 @@ class Sync(Base, metaclass=Singleton):
 
             if payloads:
                 # bulk-index each consecutive run of (tg_op, table)
-                for (op, tbl), run in groupby(
-                    payloads,
-                    key=lambda payload: (payload.tg_op, payload.table),
+                with _span(
+                    "pgsync.logical_slot_changes",
+                    resource="pgsync.logical_slot_changes",
+                    slot_name=self.__name,
+                    index=self.index,
+                    batch_size=len(payloads),
                 ):
-                    batch: list = list(run)
-                    logger.debug(f"op: {op} tbl {tbl} - {len(batch)}")
-                    current += len(batch)
-                    self.log_xlog_progress(current, total, bar_length=30)
-                    self.search_client.bulk(self.index, self._payloads(batch))
-                    self.count["xlog"] += len(batch)
+                    for (op, tbl), run in groupby(
+                        payloads,
+                        key=lambda payload: (payload.tg_op, payload.table),
+                    ):
+                        batch: list = list(run)
+                        logger.debug(f"op: {op} tbl {tbl} - {len(batch)}")
+                        current += len(batch)
+                        self.log_xlog_progress(current, total, bar_length=30)
+                        self.search_client.bulk(self.index, self._payloads(batch))
+                        self.count["xlog"] += len(batch)
 
         # mark those rows consumed
         self.logical_slot_get_changes(
@@ -524,6 +549,21 @@ class Sync(Base, metaclass=Singleton):
         - Greedily chunks so no per-field 'terms' list exceeds max_terms_count
         - Issues one search per chunk and de-dupes doc_ids
         """
+        with _span(
+            "pgsync.root_pk_resolver",
+            resource="pgsync.root_pk_resolver",
+            index=self.index,
+            table=node.table,
+            payload_count=len(payloads),
+        ):
+            return self.__root_primary_key_resolver(node, payloads, filters)
+
+    def __root_primary_key_resolver(
+        self,
+        node: Node,
+        payloads: t.Sequence[Payload],
+        filters: list,
+    ) -> list:
         if not payloads:
             return filters
 
@@ -620,6 +660,24 @@ class Sync(Base, metaclass=Singleton):
         Splits large value sets into chunks so that each field's terms list
         is <= max_terms_count (defaults to 65536).
         """
+        with _span(
+            "pgsync.root_fk_resolver",
+            resource="pgsync.root_fk_resolver",
+            index=self.index,
+            table=node.table,
+            payload_count=len(payloads),
+        ):
+            return self.__root_foreign_key_resolver(
+                node, payloads, foreign_keys, filters
+            )
+
+    def __root_foreign_key_resolver(
+        self,
+        node: Node,
+        payloads: t.Sequence[Payload],
+        foreign_keys: dict,
+        filters: list,
+    ) -> list:
         if not payloads:
             return filters
 
@@ -692,6 +750,21 @@ class Sync(Base, metaclass=Singleton):
         For each payload, if it carries a foreign key to the root, append a
         {remote_field: value} filter. Deduplicates to avoid redundant entries.
         """
+        with _span(
+            "pgsync.through_node_resolver",
+            resource="pgsync.through_node_resolver",
+            index=self.index,
+            table=node.table,
+            payload_count=len(payloads),
+        ):
+            return self.__through_node_resolver(node, payloads, filters)
+
+    def __through_node_resolver(
+        self,
+        node: Node,
+        payloads: t.Sequence[Payload],
+        filters: list,
+    ) -> list:
         if not payloads:
             return filters
 
@@ -721,6 +794,20 @@ class Sync(Base, metaclass=Singleton):
         return filters
 
     def _insert_op(
+        self, node: Node, filters: dict, payloads: t.List[Payload]
+    ) -> dict:
+        with _span(
+            "pgsync.insert_op",
+            resource="pgsync.insert_op",
+            index=self.index,
+            table=node.table,
+            is_through=node.is_through,
+            is_root=node.is_root,
+            payload_count=len(payloads),
+        ):
+            return self.__insert_op(node, filters, payloads)
+
+    def __insert_op(
         self, node: Node, filters: dict, payloads: t.List[Payload]
     ) -> dict:
         if node.is_through:
@@ -836,6 +923,22 @@ class Sync(Base, metaclass=Singleton):
         filters: dict,
         payloads: t.List[dict],
     ) -> dict:
+        with _span(
+            "pgsync.update_op",
+            resource="pgsync.update_op",
+            index=self.index,
+            table=node.table,
+            is_root=node.is_root,
+            payload_count=len(payloads),
+        ):
+            return self.__update_op(node, filters, payloads)
+
+    def __update_op(
+        self,
+        node: Node,
+        filters: dict,
+        payloads: t.List[dict],
+    ) -> dict:
         if node.is_root:
             # Here, we are performing two operations:
             # 1) Build a filter to sync the updated record(s)
@@ -917,6 +1020,19 @@ class Sync(Base, metaclass=Singleton):
     def _delete_op(
         self, node: Node, filters: dict, payloads: t.List[dict]
     ) -> dict:
+        with _span(
+            "pgsync.delete_op",
+            resource="pgsync.delete_op",
+            index=self.index,
+            table=node.table,
+            is_root=node.is_root,
+            payload_count=len(payloads),
+        ):
+            return self.__delete_op(node, filters, payloads)
+
+    def __delete_op(
+        self, node: Node, filters: dict, payloads: t.List[dict]
+    ) -> dict:
         # when deleting a root node, just delete the doc in
         # Elasticsearch/OpenSearch
         if node.is_root:
@@ -969,6 +1085,16 @@ class Sync(Base, metaclass=Singleton):
         return filters
 
     def _truncate_op(self, node: Node, filters: dict) -> dict:
+        with _span(
+            "pgsync.truncate_op",
+            resource="pgsync.truncate_op",
+            index=self.index,
+            table=node.table,
+            is_root=node.is_root,
+        ):
+            return self.__truncate_op(node, filters)
+
+    def __truncate_op(self, node: Node, filters: dict) -> dict:
         if node.is_root:
             docs: list = []
             for doc_id in self.search_client._search(self.index, node.table):
@@ -1030,37 +1156,46 @@ class Sync(Base, metaclass=Singleton):
         ]
 
         """
-        payload: Payload = payloads[0]
-        if payload.tg_op not in TG_OP:
-            logger.exception(f"Unknown tg_op {payload.tg_op}")
-            raise InvalidTGOPError(f"Unknown tg_op {payload.tg_op}")
+        with _span(
+            "pgsync.payloads_validate",
+            resource="pgsync.payloads_validate",
+            payload_count=len(payloads),
+        ) as validate_span:
+            payload: Payload = payloads[0]
+            if payload.tg_op not in TG_OP:
+                logger.exception(f"Unknown tg_op {payload.tg_op}")
+                raise InvalidTGOPError(f"Unknown tg_op {payload.tg_op}")
 
-        # we might receive an event triggered for a table
-        # that is not in the tree node.
-        # e.g a through table which we need to react to.
-        # in this case, we find the parent of the through
-        # table and force a re-sync.
-        if (
-            payload.table not in self.tree.tables
-            or payload.schema not in self.tree.schemas
-        ):
-            return
+            # we might receive an event triggered for a table
+            # that is not in the tree node.
+            # e.g a through table which we need to react to.
+            # in this case, we find the parent of the through
+            # table and force a re-sync.
+            if (
+                payload.table not in self.tree.tables
+                or payload.schema not in self.tree.schemas
+            ):
+                return
 
-        node: Node = self.tree.get_node(payload.table, payload.schema)
+            node: Node = self.tree.get_node(payload.table, payload.schema)
+            if validate_span is not None and hasattr(validate_span, 'set_tag'):
+                validate_span.set_tag("table", node.table)
 
-        for payload in payloads:
-            # this is only required for the non truncate tg_ops
-            if payload.data:
-                if not set(node.model.primary_keys).issubset(
-                    set(payload.data.keys())
-                ):
-                    logger.exception(
-                        f"Primary keys {node.model.primary_keys} not subset "
-                        f"of payload data {payload.data.keys()} for table "
-                        f"{payload.schema}.{payload.table}"
-                    )
-                    raise
+            for payload in payloads:
+                # this is only required for the non truncate tg_ops
+                if payload.data:
+                    if not set(node.model.primary_keys).issubset(
+                        set(payload.data.keys())
+                    ):
+                        logger.exception(
+                            f"Primary keys {node.model.primary_keys} not subset "
+                            f"of payload data {payload.data.keys()} for table "
+                            f"{payload.schema}.{payload.table}"
+                        )
+                        raise
 
+        # node and payload are defined inside the with block above but
+        # accessible here due to Python scoping (with blocks don't create scope)
         logger.debug(f"tg_op: {payload.tg_op} table: {node.name}")
 
         filters: dict = {
@@ -1070,29 +1205,39 @@ class Sync(Base, metaclass=Singleton):
         if not node.is_root:
             filters[node.parent.table] = []
 
-        if payload.tg_op == INSERT:
-            filters = self._insert_op(
-                node,
-                filters,
-                payloads,
-            )
+        with _span(
+            "pgsync.resolve_filters",
+            resource="pgsync.resolve_filters",
+            index=self.index,
+            table=node.table,
+            tg_op=payload.tg_op,
+            is_root=node.is_root,
+            is_through=node.is_through,
+            payload_count=len(payloads),
+        ):
+            if payload.tg_op == INSERT:
+                filters = self._insert_op(
+                    node,
+                    filters,
+                    payloads,
+                )
 
-        if payload.tg_op == UPDATE:
-            filters = self._update_op(
-                node,
-                filters,
-                payloads,
-            )
+            if payload.tg_op == UPDATE:
+                filters = self._update_op(
+                    node,
+                    filters,
+                    payloads,
+                )
 
-        if payload.tg_op == DELETE:
-            filters = self._delete_op(
-                node,
-                filters,
-                payloads,
-            )
+            if payload.tg_op == DELETE:
+                filters = self._delete_op(
+                    node,
+                    filters,
+                    payloads,
+                )
 
-        if payload.tg_op == TRUNCATE:
-            filters = self._truncate_op(node, filters)
+            if payload.tg_op == TRUNCATE:
+                filters = self._truncate_op(node, filters)
 
         # If there are no filters, then don't execute the sync query
         # otherwise we would end up performing a full query
@@ -1168,72 +1313,119 @@ class Sync(Base, metaclass=Singleton):
         Yields:
             dict: A dictionary representing a doc to be indexed in Elasticsearch.
         """
-        self.query_builder.isouter = True
-        self.query_builder.from_obj = None
-
-        for node in self.tree.traverse_post_order():
-            node._subquery = None
-            node._filters = []
-            node.setup()
-
-            try:
-                self.query_builder.build_queries(
-                    node, filters=filters, txmin=txmin, txmax=txmax, ctid=ctid
-                )
-            except Exception as e:
-                logger.exception(f"Exception {e}")
-                raise
-
-        if self.verbose:
-            compiled_query(node._subquery, "Query")
-
-        for i, (keys, row, primary_keys) in enumerate(
-            self.fetchmany(node._subquery)
+        root_table = self.tree.root.table if self.tree.root else ""
+        filter_size = (
+            len(filters.get(self.tree.root.table, []))
+            if filters and self.tree.root
+            else 0
+        )
+        with _span(
+            "pgsync.sync",
+            resource="pgsync.sync",
+            index=self.index,
+            table=root_table,
+            filter_size=filter_size,
         ):
-            row: dict = Transform.transform(row, self.nodes)
+            self.query_builder.isouter = True
+            self.query_builder.from_obj = None
 
-            row[META] = Transform.get_primary_keys(keys)
+            for node in self.tree.traverse_post_order():
+                node._subquery = None
+                node._filters = []
+                node.setup()
 
-            if node.is_root:
-                primary_key_values: t.List[str] = list(map(str, primary_keys))
-                primary_key_names: t.List[str] = [
-                    primary_key.name for primary_key in node.primary_keys
-                ]
-                # TODO: add support for composite pkeys
-                row[META][node.table] = {
-                    primary_key_names[0]: [primary_key_values[0]],
-                }
+                try:
+                    with _span(
+                        "pgsync.query_builder.build",
+                        resource="pgsync.query_builder.build",
+                        index=self.index,
+                    ):
+                        self.query_builder.build_queries(
+                            node, filters=filters, txmin=txmin, txmax=txmax, ctid=ctid
+                        )
+                except Exception as e:
+                    logger.exception(f"Exception {e}")
+                    raise
 
             if self.verbose:
-                print(f"{(i+1)})")
-                print(f"pkeys: {primary_keys}")
-                pprint.pprint(row)
-                print("-" * 10)
+                compiled_query(node._subquery, "Query")
 
-            doc: dict = {
-                "_id": self.get_doc_id(primary_keys, node.table),
-                "_index": self.index,
-                "_source": row,
-            }
+            # fetchmany() is called once per node; it returns a generator that yields
+            # row-by-row. DB work happens in chunks (partitions); each chunk gets
+            # its own span in base.fetchmany (pgsync.fetchmany.partition).
+            with _span(
+                "pgsync.fetchmany",
+                resource="pgsync.fetchmany",
+                index=self.index,
+                table=node.table,
+            ) as fetchmany_span:
+                row_count = 0
+                for i, (keys, row, primary_keys) in enumerate(
+                    self.fetchmany(node._subquery)
+                ):
+                    row_count += 1
 
-            if self.routing:
-                doc["_routing"] = row[self.routing]
+                    with _span(
+                        "pgsync.row_transform",
+                        resource="pgsync.row_transform",
+                    ):
+                        row: dict = Transform.transform(row, self.nodes)
 
-            if (
-                self.search_client.major_version < 7
-                and not self.search_client.is_opensearch
-            ):
-                doc["_type"] = "_doc"
+                        row[META] = Transform.get_primary_keys(keys)
 
-            if self._plugins:
-                doc = next(self._plugins.transform([doc]))
-                if not doc:
-                    continue
+                        if node.is_root:
+                            primary_key_values: t.List[str] = list(map(str, primary_keys))
+                            primary_key_names: t.List[str] = [
+                                primary_key.name for primary_key in node.primary_keys
+                            ]
+                            # TODO: add support for composite pkeys
+                            row[META][node.table] = {
+                                primary_key_names[0]: [primary_key_values[0]],
+                            }
 
-            if self.pipeline:
-                doc["pipeline"] = self.pipeline
+                        if self.verbose:
+                            print(f"{(i+1)})")
+                            print(f"pkeys: {primary_keys}")
+                            pprint.pprint(row)
+                            print("-" * 10)
 
-            yield doc
+                        doc: dict = {
+                            "_id": self.get_doc_id(primary_keys, node.table),
+                            "_index": self.index,
+                            "_source": row,
+                        }
+
+                        if self.routing:
+                            doc["_routing"] = row[self.routing]
+
+                        if (
+                            self.search_client.major_version < 7
+                            and not self.search_client.is_opensearch
+                        ):
+                            doc["_type"] = "_doc"
+
+                    if self._plugins:
+                        with _span(
+                            "pgsync.plugin_transform",
+                            resource="pgsync.plugin_transform",
+                            index=self.index,
+                            doc_id=doc.get("_id", ""),
+                        ):
+                            doc = next(self._plugins.transform([doc]))
+                        if not doc:
+                            continue
+
+                    if self.pipeline:
+                        doc["pipeline"] = self.pipeline
+
+                    with _span(
+                        "pgsync.yield_wait",
+                        resource="pgsync.yield_wait",
+                    ):
+                        yield doc
+
+                if fetchmany_span is not None and hasattr(fetchmany_span, 'set_tag'):
+                    fetchmany_span.set_tag("row_count", row_count)
 
     @property
     def checkpoint(self) -> int:
@@ -1244,15 +1436,20 @@ class Sync(Base, metaclass=Singleton):
         :rtype: int
         """
         raw: t.Optional[str]
-        if settings.REDIS_CHECKPOINT:
-            raw = self.redis.get_meta(default={}).get("checkpoint")
-        else:
-            path: Path = Path(self.checkpoint_file)
-            raw = (
-                path.read_text(encoding="utf-8").split()[0]
-                if path.exists()
-                else None
-            )
+        with _span(
+            "pgsync.checkpoint.read",
+            resource="pgsync.checkpoint.read",
+            index=self.index,
+        ):
+            if settings.REDIS_CHECKPOINT:
+                raw = self.redis.get_meta(default={}).get("checkpoint")
+            else:
+                path: Path = Path(self.checkpoint_file)
+                raw = (
+                    path.read_text(encoding="utf-8").split()[0]
+                    if path.exists()
+                    else None
+                )
 
         if raw is None:
             return None
@@ -1276,12 +1473,17 @@ class Sync(Base, metaclass=Singleton):
         if value is None:
             raise TypeError("Cannot assign a None value to checkpoint")
 
-        if settings.REDIS_CHECKPOINT:
-            self.redis.set_meta({"checkpoint": value})
-        else:
-            Path(self.checkpoint_file).write_text(
-                f"{value}\n", encoding="utf-8"
-            )
+        with _span(
+            "pgsync.checkpoint.write",
+            resource="pgsync.checkpoint.write",
+            index=self.index,
+        ):
+            if settings.REDIS_CHECKPOINT:
+                self.redis.set_meta({"checkpoint": value})
+            else:
+                Path(self.checkpoint_file).write_text(
+                    f"{value}\n", encoding="utf-8"
+                )
 
         # Update in-memory cache last
         self._checkpoint = value
@@ -1312,12 +1514,31 @@ class Sync(Base, metaclass=Singleton):
 
         if payloads:
             logger.debug(f"_poll_redis: {payloads}")
-            with self.lock:
-                self.count["redis"] += len(payloads)
-            self.refresh_views()
-            self.on_publish(
-                list(map(lambda payload: Payload(**payload), payloads))
-            )
+            with _span(
+                "pgsync.poll_redis",
+                resource="pgsync.poll_redis",
+                payload_count=len(payloads),
+                index=self.index,
+                iteration_type="consumer",
+                mode="sync",
+            ):
+                with self.lock:
+                    self.count["redis"] += len(payloads)
+                with _span(
+                    "pgsync.refresh_views",
+                    resource="pgsync.refresh_views",
+                    index=self.index,
+                ):
+                    self.refresh_views()
+                with _span(
+                    "pgsync.payload_deserialize",
+                    resource="pgsync.payload_deserialize",
+                    payload_count=len(payloads),
+                ):
+                    parsed = list(
+                        map(lambda payload: Payload(**payload), payloads)
+                    )
+                self.on_publish(parsed)
         time.sleep(settings.REDIS_POLL_INTERVAL)
 
     @threaded
@@ -1335,11 +1556,30 @@ class Sync(Base, metaclass=Singleton):
         payloads: list = self.redis.pop()
         if payloads:
             logger.debug(f"_async_poll_redis: {payloads}")
-            self.count["redis"] += len(payloads)
-            await self.async_refresh_views()
-            await self.async_on_publish(
-                list(map(lambda payload: Payload(**payload), payloads))
-            )
+            with _span(
+                "pgsync.poll_redis",
+                resource="pgsync.poll_redis",
+                payload_count=len(payloads),
+                index=self.index,
+                iteration_type="consumer",
+                mode="async",
+            ):
+                self.count["redis"] += len(payloads)
+                with _span(
+                    "pgsync.refresh_views",
+                    resource="pgsync.refresh_views",
+                    index=self.index,
+                ):
+                    await self.async_refresh_views()
+                with _span(
+                    "pgsync.payload_deserialize",
+                    resource="pgsync.payload_deserialize",
+                    payload_count=len(payloads),
+                ):
+                    parsed = list(
+                        map(lambda payload: Payload(**payload), payloads)
+                    )
+                await self.async_on_publish(parsed)
         await asyncio.sleep(settings.REDIS_POLL_INTERVAL)
 
     @exception
@@ -1374,7 +1614,15 @@ class Sync(Base, metaclass=Singleton):
             ):
                 # Catch any hanging items from the last poll
                 if payloads:
-                    self.redis.push(payloads)
+                    with _span(
+                        "pgsync.poll_db",
+                        resource="pgsync.poll_db",
+                        payload_count=len(payloads),
+                        index=self.index,
+                        iteration_type="producer",
+                        mode="sync",
+                    ):
+                        self.redis.push(payloads)
                     payloads = []
                 continue
 
@@ -1386,7 +1634,15 @@ class Sync(Base, metaclass=Singleton):
 
             while conn.notifies:
                 if len(payloads) >= settings.REDIS_WRITE_CHUNK_SIZE:
-                    self.redis.push(payloads)
+                    with _span(
+                        "pgsync.poll_db",
+                        resource="pgsync.poll_db",
+                        payload_count=len(payloads),
+                        index=self.index,
+                        iteration_type="producer",
+                        mode="sync",
+                    ):
+                        self.redis.push(payloads)
                     payloads = []
                 notification: t.AnyStr = conn.notifies.pop(0)
                 if notification.channel == self.database:
@@ -1431,7 +1687,15 @@ class Sync(Base, metaclass=Singleton):
                     and self.index in payload["indices"]
                     and payload["schema"] in self.tree.schemas
                 ):
-                    self.redis.push([payload])
+                    with _span(
+                        "pgsync.poll_db",
+                        resource="pgsync.poll_db",
+                        payload_count=1,
+                        index=self.index,
+                        iteration_type="producer",
+                        mode="async",
+                    ):
+                        self.redis.push([payload])
                     logger.debug(f"async_poll: {payload}")
                     self.count["db"] += 1
 
@@ -1445,7 +1709,14 @@ class Sync(Base, metaclass=Singleton):
         for node in self.tree.traverse_breadth_first():
             if node.table in self.views(node.schema):
                 if node.table in self._materialized_views(node.schema):
-                    self.refresh_view(node.table, node.schema)
+                    with _span(
+                        "pgsync.refresh_view",
+                        resource="pgsync.refresh_view",
+                        index=self.index,
+                        table=node.table,
+                        schema=node.schema,
+                    ):
+                        self.refresh_view(node.table, node.schema)
 
     def on_publish(self, payloads: t.List[Payload]) -> None:
         self._on_publish(payloads)
@@ -1461,53 +1732,71 @@ class Sync(Base, metaclass=Singleton):
         It is called when an event is received from Redis/Valkey.
         Deserialize the payload from Redis/Valkey and sync to Elasticsearch/OpenSearch
         """
-        # this is used for the views.
-        # we substitute the views for the base table here
-        for i, payload in enumerate(payloads):
-            for node in self.tree.traverse_breadth_first():
-                if payload.table in node.base_tables:
-                    payloads[i].table = node.table
+        with _span(
+            "pgsync.on_publish",
+            resource="pgsync.on_publish",
+            payload_count=len(payloads),
+            index=self.index,
+            tg_ops=",".join(sorted(set(p.tg_op for p in payloads if p.tg_op))),
+            tables=",".join(sorted(set(p.table for p in payloads if p.table))),
+        ):
+            # this is used for the views.
+            # we substitute the views for the base table here
+            with _span(
+                "pgsync.view_substitution",
+                resource="pgsync.view_substitution",
+                payload_count=len(payloads),
+            ):
+                for i, payload in enumerate(payloads):
+                    for node in self.tree.traverse_breadth_first():
+                        if payload.table in node.base_tables:
+                            payloads[i].table = node.table
 
-        logger.debug(f"on_publish len {len(payloads)}")
-        # Safe inserts are insert operations that can be performed in any order
-        # Optimize the safe INSERTS
-        # TODO repeat this for the other place too
-        # if all payload operations are INSERTS
-        if set(map(lambda x: x.tg_op, payloads)) == set([INSERT]):
-            _payloads: dict = defaultdict(list)
+            logger.debug(f"on_publish len {len(payloads)}")
+            # Safe inserts are insert operations that can be performed in any order
+            # Optimize the safe INSERTS
+            # TODO repeat this for the other place too
+            # if all payload operations are INSERTS
+            if set(map(lambda x: x.tg_op, payloads)) == set([INSERT]):
+                _payloads: dict = defaultdict(list)
 
-            for payload in payloads:
-                _payloads[payload.table].append(payload)
+                for payload in payloads:
+                    _payloads[payload.table].append(payload)
 
-            for _payload in _payloads.values():
-                self.search_client.bulk(self.index, self._payloads(_payload))
+                for _payload in _payloads.values():
+                    self.search_client.bulk(self.index, self._payloads(_payload))
 
-        else:
-            _payloads: t.List[Payload] = []
-            for i, payload in enumerate(payloads):
-                _payloads.append(payload)
-                j: int = i + 1
-                if j < len(payloads):
-                    payload2 = payloads[j]
-                    if (
-                        payload.tg_op != payload2.tg_op
-                        or payload.table != payload2.table
-                    ):
+            else:
+                _payloads: t.List[Payload] = []
+                for i, payload in enumerate(payloads):
+                    _payloads.append(payload)
+                    j: int = i + 1
+                    if j < len(payloads):
+                        payload2 = payloads[j]
+                        if (
+                            payload.tg_op != payload2.tg_op
+                            or payload.table != payload2.table
+                        ):
+                            self.search_client.bulk(
+                                self.index,
+                                self._payloads(_payloads),
+                            )
+                            _payloads = []
+                    elif j == len(payloads):
                         self.search_client.bulk(
-                            self.index,
-                            self._payloads(_payloads),
+                            self.index, self._payloads(_payloads)
                         )
-                        _payloads = []
-                elif j == len(payloads):
-                    self.search_client.bulk(
-                        self.index, self._payloads(_payloads)
-                    )
-                    _payloads: list = []
+                        _payloads: list = []
 
-        txids: t.Set = set(map(lambda x: x.xmin, payloads))
-        # for truncate, tg_op txids is None so skip setting the checkpoint
-        if txids != set([None]):
-            self.checkpoint: int = min(min(txids), self.txid_current) - 1
+            txids: t.Set = set(map(lambda x: x.xmin, payloads))
+            # for truncate, tg_op txids is None so skip setting the checkpoint
+            if txids != set([None]):
+                with _span(
+                    "pgsync.txid_current",
+                    resource="pgsync.txid_current",
+                ):
+                    _txid = self.txid_current
+                self.checkpoint: int = min(min(txids), _txid) - 1
 
     def pull(self, polling: bool = False) -> None:
         """Pull data from db."""
@@ -1516,30 +1805,37 @@ class Sync(Base, metaclass=Singleton):
         logical_slot_chunk_size: int = settings.LOGICAL_SLOT_CHUNK_SIZE
 
         logger.debug(f"pull txmin: {txmin} - txmax: {txmax}")
-        # forward pass sync
-        self.search_client.bulk(
-            self.index, self.sync(txmin=txmin, txmax=txmax)
-        )
-
-        # this is the max lsn we should go upto
-        upto_lsn: str = self.current_wal_lsn
-        try:
-            # now sync up to txmax to capture everything we may have missed
-            self.logical_slot_changes(
-                txmin=txmin,
-                txmax=txmax,
-                logical_slot_chunk_size=logical_slot_chunk_size,
-                upto_lsn=upto_lsn,
+        with _span(
+            "pgsync.pull",
+            resource="pgsync.pull",
+            index=self.index,
+            database=self.database,
+            txmin=txmin,
+            txmax=txmax,
+        ):
+            # forward pass sync
+            self.search_client.bulk(
+                self.index, self.sync(txmin=txmin, txmax=txmax)
             )
-        except Exception as e:
-            # if we are polling, we can just continue
-            if polling:
-                return
-            else:
-                raise
 
-        self.checkpoint: int = txmax or self.txid_current
-        self._truncate = True
+            # this is the max lsn we should go upto
+            upto_lsn: str = self.current_wal_lsn
+            try:
+                # now sync up to txmax to capture everything we may have missed
+                self.logical_slot_changes(
+                    txmin=txmin,
+                    txmax=txmax,
+                    logical_slot_chunk_size=logical_slot_chunk_size,
+                    upto_lsn=upto_lsn,
+                )
+            except Exception as e:
+                # if we are polling, we can just continue
+                if polling:
+                    return
+                raise
+            else:
+                self.checkpoint = txmax or self.txid_current
+                self._truncate = True
 
     @threaded
     @exception
@@ -1558,7 +1854,13 @@ class Sync(Base, metaclass=Singleton):
     def _truncate_slots(self) -> None:
         if self._truncate:
             logger.debug(f"Truncating replication slot: {self.__name}")
-            self.logical_slot_get_changes(self.__name, upto_nchanges=None)
+            with _span(
+                "pgsync.truncate_slots",
+                resource="pgsync.truncate_slots",
+                index=self.index,
+                slot_name=self.__name,
+            ):
+                self.logical_slot_get_changes(self.__name, upto_nchanges=None)
 
     @threaded
     @exception
@@ -1807,7 +2109,13 @@ def main(
                 config=config, s3_schema_url=s3_schema_url
             ):
                 sync: Sync = Sync(doc, verbose=verbose, **kwargs)
-                sync.analyze()
+                with _span(
+                    "pgsync.analyze",
+                    resource="pgsync.analyze",
+                    index=doc.get("index") or doc.get("database"),
+                    iteration_type="analyze",
+                ):
+                    sync.analyze()
 
         elif polling:
             # In polling mode, the app can run without replication slots or triggers.
@@ -1815,11 +2123,16 @@ def main(
             # It should be considered a workaround for running on a read-only cluster.
             kwargs["polling"] = True
             while True:
-                for doc in config_loader(
-                    config=config, s3_schema_url=s3_schema_url
+                with _span(
+                    "pgsync.polling.iteration",
+                    resource="pgsync.polling.iteration",
+                    iteration_type="polling",
                 ):
-                    sync: Sync = Sync(doc, verbose=verbose, **kwargs)
-                    sync.pull(polling=True)
+                    for doc in config_loader(
+                        config=config, s3_schema_url=s3_schema_url
+                    ):
+                        sync: Sync = Sync(doc, verbose=verbose, **kwargs)
+                        sync.pull(polling=True)
                 time.sleep(settings.POLL_INTERVAL)
 
         else:

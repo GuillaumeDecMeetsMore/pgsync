@@ -3,6 +3,7 @@
 import logging
 import os
 import random
+import sys
 import threading
 import time
 import typing as t
@@ -11,6 +12,11 @@ from contextlib import contextmanager
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql  # noqa
 from sqlalchemy.orm import sessionmaker
+
+try:
+    from ddtrace import tracer as _dd_tracer
+except ImportError:
+    _dd_tracer = None
 
 from .constants import (
     BUILTIN_SCHEMAS,
@@ -698,22 +704,37 @@ class Base(object):
         To get ALL changes and data in existing replication slot:
         SELECT * FROM PG_LOGICAL_SLOT_GET_CHANGES('testdb', NULL, NULL)
         """
-        with self.advisory_lock(
-            slot_name, max_retries=None, retry_interval=0.1
-        ):
-            statement: sa.sql.Select = self._logical_slot_changes(
-                slot_name,
-                sa.func.PG_LOGICAL_SLOT_GET_CHANGES,
-                txmin=txmin,
-                txmax=txmax,
-                upto_lsn=upto_lsn,
-                upto_nchanges=upto_nchanges,
-                limit=limit,
-                offset=offset,
+        span = None
+        if _dd_tracer:
+            span = _dd_tracer.trace(
+                "pgsync.logical_slot", resource="pgsync.logical_slot.get_changes"
             )
-            self.execute(
-                statement, options=dict(stream_results=STREAM_RESULTS)
-            )
+            span.set_tag("slot_name", slot_name)
+            if limit is not None:
+                span.set_tag("limit", limit)
+            if offset is not None:
+                span.set_tag("offset", offset)
+            span.__enter__()
+        try:
+            with self.advisory_lock(
+                slot_name, max_retries=None, retry_interval=0.1
+            ):
+                statement: sa.sql.Select = self._logical_slot_changes(
+                    slot_name,
+                    sa.func.PG_LOGICAL_SLOT_GET_CHANGES,
+                    txmin=txmin,
+                    txmax=txmax,
+                    upto_lsn=upto_lsn,
+                    upto_nchanges=upto_nchanges,
+                    limit=limit,
+                    offset=offset,
+                )
+                self.execute(
+                    statement, options=dict(stream_results=STREAM_RESULTS)
+                )
+        finally:
+            if span:
+                span.__exit__(*sys.exc_info())
 
     def logical_slot_peek_changes(
         self,
@@ -729,20 +750,35 @@ class Base(object):
 
         SELECT * FROM PG_LOGICAL_SLOT_PEEK_CHANGES('testdb', NULL, 1)
         """
-        with self.advisory_lock(
-            slot_name, max_retries=None, retry_interval=0.1
-        ):
-            statement: sa.sql.Select = self._logical_slot_changes(
-                slot_name,
-                sa.func.PG_LOGICAL_SLOT_PEEK_CHANGES,
-                txmin=txmin,
-                txmax=txmax,
-                upto_lsn=upto_lsn,
-                upto_nchanges=upto_nchanges,
-                limit=limit,
-                offset=offset,
+        span = None
+        if _dd_tracer:
+            span = _dd_tracer.trace(
+                "pgsync.logical_slot", resource="pgsync.logical_slot.peek_changes"
             )
-            return self.fetchall(statement)
+            span.set_tag("slot_name", slot_name)
+            if limit is not None:
+                span.set_tag("limit", limit)
+            if offset is not None:
+                span.set_tag("offset", offset)
+            span.__enter__()
+        try:
+            with self.advisory_lock(
+                slot_name, max_retries=None, retry_interval=0.1
+            ):
+                statement: sa.sql.Select = self._logical_slot_changes(
+                    slot_name,
+                    sa.func.PG_LOGICAL_SLOT_PEEK_CHANGES,
+                    txmin=txmin,
+                    txmax=txmax,
+                    upto_lsn=upto_lsn,
+                    upto_nchanges=upto_nchanges,
+                    limit=limit,
+                    offset=offset,
+                )
+                return self.fetchall(statement)
+        finally:
+            if span:
+                span.__exit__(*sys.exc_info())
 
     def logical_slot_count_changes(
         self,
@@ -752,18 +788,30 @@ class Base(object):
         upto_lsn: t.Optional[str] = None,
         upto_nchanges: t.Optional[int] = None,
     ) -> int:
-        statement: sa.sql.Select = self._logical_slot_changes(
-            slot_name,
-            sa.func.PG_LOGICAL_SLOT_PEEK_CHANGES,
-            txmin=txmin,
-            txmax=txmax,
-            upto_lsn=upto_lsn,
-            upto_nchanges=upto_nchanges,
-        )
-        with self.engine.connect() as conn:
-            return conn.execute(
-                statement.with_only_columns(*[sa.func.COUNT()])
-            ).scalar()
+        span = None
+        if _dd_tracer:
+            span = _dd_tracer.trace(
+                "pgsync.logical_slot",
+                resource="pgsync.logical_slot.count_changes",
+            )
+            span.set_tag("slot_name", slot_name)
+            span.__enter__()
+        try:
+            statement: sa.sql.Select = self._logical_slot_changes(
+                slot_name,
+                sa.func.PG_LOGICAL_SLOT_PEEK_CHANGES,
+                txmin=txmin,
+                txmax=txmax,
+                upto_lsn=upto_lsn,
+                upto_nchanges=upto_nchanges,
+            )
+            with self.engine.connect() as conn:
+                return conn.execute(
+                    statement.with_only_columns(*[sa.func.COUNT()])
+                ).scalar()
+        finally:
+            if span:
+                span.__exit__(*sys.exc_info())
 
     # Views...
 
@@ -1148,15 +1196,115 @@ class Base(object):
     ):
         chunk_size = chunk_size or QUERY_CHUNK_SIZE
         stream_results = stream_results or STREAM_RESULTS
-        with self.engine.connect() as conn:
-            result = conn.execution_options(
-                stream_results=stream_results
-            ).execute(statement.select())
-            for partition in result.partitions(chunk_size):
-                for keys, row, *primary_keys in partition:
-                    yield keys, row, primary_keys
-            result.close()
-        self.engine.clear_compiled_cache()
+
+        # --- connect ---
+        conn_span = None
+        if _dd_tracer:
+            conn_span = _dd_tracer.trace(
+                "pgsync.db.connect",
+                resource="pgsync.db.connect",
+            )
+            conn_span.__enter__()
+        try:
+            conn_ctx = self.engine.connect()
+            conn = conn_ctx.__enter__()
+        finally:
+            if conn_span:
+                conn_span.__exit__(*sys.exc_info())
+
+        try:
+            # --- execute (declare cursor) ---
+            exec_span = None
+            if _dd_tracer:
+                exec_span = _dd_tracer.trace(
+                    "pgsync.db.execute",
+                    resource="pgsync.db.execute",
+                )
+                exec_span.set_tag("stream_results", stream_results)
+                exec_span.__enter__()
+            try:
+                result = conn.execution_options(
+                    stream_results=stream_results
+                ).execute(statement.select())
+            finally:
+                if exec_span:
+                    exec_span.__exit__(*sys.exc_info())
+
+            # --- iterate partitions manually so we can span the FETCH ---
+            partitions_iter = result.partitions(chunk_size)
+            partition_index = 0
+            while True:
+                # span the actual FETCH from server-side cursor
+                fetch_span = None
+                if _dd_tracer:
+                    fetch_span = _dd_tracer.trace(
+                        "pgsync.db.cursor_fetch",
+                        resource="pgsync.db.cursor_fetch",
+                    )
+                    fetch_span.set_tag("chunk_size", chunk_size)
+                    fetch_span.set_tag("partition_index", partition_index)
+                    fetch_span.__enter__()
+                exhausted = False
+                try:
+                    partition = next(partitions_iter)
+                except StopIteration:
+                    exhausted = True
+                    if fetch_span:
+                        fetch_span.set_tag("exhausted", True)
+                finally:
+                    if fetch_span:
+                        # Use None to avoid marking StopIteration as an error
+                        fetch_span.__exit__(None, None, None)
+                if exhausted:
+                    break
+
+                # --- iterate rows in partition ---
+                row_span = None
+                if _dd_tracer:
+                    row_span = _dd_tracer.trace(
+                        "pgsync.db.partition_iterate",
+                        resource="pgsync.db.partition_iterate",
+                    )
+                    row_span.set_tag("chunk_size", chunk_size)
+                    row_span.set_tag("partition_index", partition_index)
+                    row_span.__enter__()
+                try:
+                    for keys, row, *primary_keys in partition:
+                        yield keys, row, primary_keys
+                finally:
+                    if row_span:
+                        row_span.__exit__(*sys.exc_info())
+
+                partition_index += 1
+
+            # --- close result (cursor cleanup) ---
+            close_span = None
+            if _dd_tracer:
+                close_span = _dd_tracer.trace(
+                    "pgsync.db.cursor_close",
+                    resource="pgsync.db.cursor_close",
+                )
+                close_span.__enter__()
+            try:
+                result.close()
+            finally:
+                if close_span:
+                    close_span.__exit__(*sys.exc_info())
+        finally:
+            # --- connection return to pool ---
+            disconnect_span = None
+            if _dd_tracer:
+                disconnect_span = _dd_tracer.trace(
+                    "pgsync.db.disconnect",
+                    resource="pgsync.db.disconnect",
+                )
+                disconnect_span.__enter__()
+            try:
+                conn_ctx.__exit__(None, None, None)
+                self.engine.clear_compiled_cache()
+            finally:
+                if disconnect_span:
+                    disconnect_span.__exit__(*sys.exc_info())
 
     def fetchcount(self, statement: sa.sql.Subquery) -> int:
         with self.engine.connect() as conn:

@@ -1,6 +1,7 @@
 """PGSync SearchClient helper."""
 
 import logging
+import sys
 import typing as t
 from collections import defaultdict
 
@@ -11,6 +12,11 @@ import elasticsearch_dsl
 import opensearch_dsl
 import opensearchpy
 from requests_aws4auth import AWS4Auth
+
+try:
+    from ddtrace import tracer as _dd_tracer
+except ImportError:
+    _dd_tracer = None
 
 from . import settings
 from .constants import (
@@ -135,6 +141,14 @@ class SearchClient(object):
         )
         ignore_status = ignore_status or settings.ELASTICSEARCH_IGNORE_STATUS
 
+        span = None
+        if _dd_tracer:
+            span = _dd_tracer.trace(
+                "pgsync.search.bulk", resource="pgsync.search.bulk"
+            )
+            span.set_tag("index", index)
+            span.set_tag("chunk_size", chunk_size)
+            span.__enter__()
         try:
             self._bulk(
                 index,
@@ -155,6 +169,9 @@ class SearchClient(object):
             logger.exception(f"Exception {e}")
             if raise_on_exception or raise_on_error:
                 raise
+        finally:
+            if span:
+                span.__exit__(*sys.exc_info())
 
     def _bulk(
         self,
@@ -174,42 +191,83 @@ class SearchClient(object):
     ):
         """Bulk index, update, delete docs to Elasticsearch/OpenSearch."""
         if settings.ELASTICSEARCH_STREAMING_BULK:
-            for ok, info in self.streaming_bulk(
-                self.__client,
-                actions,
-                index=index,
-                chunk_size=chunk_size,
-                max_chunk_bytes=max_chunk_bytes,
-                max_retries=max_retries,
-                max_backoff=max_backoff,
-                initial_backoff=initial_backoff,
-                refresh=refresh,
-                raise_on_exception=raise_on_exception,
-                raise_on_error=raise_on_error,
-            ):
-                if ok:
-                    self.doc_count += 1
-                else:
-                    logger.error(f"Document failed to index: {info}")
+            sb_span = None
+            if _dd_tracer:
+                sb_span = _dd_tracer.trace(
+                    "pgsync.search.streaming_bulk",
+                    resource="pgsync.search.streaming_bulk",
+                )
+                sb_span.set_tag("chunk_size", chunk_size)
+                sb_span.set_tag("max_retries", max_retries)
+                sb_span.__enter__()
+            try:
+                doc_count = 0
+                error_count = 0
+                for ok, info in self.streaming_bulk(
+                    self.__client,
+                    actions,
+                    index=index,
+                    chunk_size=chunk_size,
+                    max_chunk_bytes=max_chunk_bytes,
+                    max_retries=max_retries,
+                    max_backoff=max_backoff,
+                    initial_backoff=initial_backoff,
+                    refresh=refresh,
+                    raise_on_exception=raise_on_exception,
+                    raise_on_error=raise_on_error,
+                ):
+                    if ok:
+                        self.doc_count += 1
+                        doc_count += 1
+                    else:
+                        logger.error(f"Document failed to index: {info}")
+                        error_count += 1
+                if sb_span:
+                    sb_span.set_tag("doc_count", doc_count)
+                    sb_span.set_tag("error_count", error_count)
+            finally:
+                if sb_span:
+                    sb_span.__exit__(*sys.exc_info())
         else:
             # parallel bulk consumes more memory and is also more likely
             # to result in 429 errors.
-            for ok, info in self.parallel_bulk(
-                self.__client,
-                actions,
-                thread_count=thread_count,
-                chunk_size=chunk_size,
-                max_chunk_bytes=max_chunk_bytes,
-                queue_size=queue_size,
-                refresh=refresh,
-                raise_on_exception=raise_on_exception,
-                raise_on_error=raise_on_error,
-                ignore_status=ignore_status,
-            ):
-                if ok:
-                    self.doc_count += 1
-                else:
-                    logger.error(f"Document failed to index: {info}")
+            pb_span = None
+            if _dd_tracer:
+                pb_span = _dd_tracer.trace(
+                    "pgsync.search.parallel_bulk",
+                    resource="pgsync.search.parallel_bulk",
+                )
+                pb_span.set_tag("chunk_size", chunk_size)
+                pb_span.set_tag("thread_count", thread_count)
+                pb_span.set_tag("queue_size", queue_size)
+                pb_span.__enter__()
+            try:
+                doc_count = 0
+                error_count = 0
+                for ok, info in self.parallel_bulk(
+                    self.__client,
+                    actions,
+                    thread_count=thread_count,
+                    chunk_size=chunk_size,
+                    max_chunk_bytes=max_chunk_bytes,
+                    queue_size=queue_size,
+                    refresh=refresh,
+                    raise_on_exception=raise_on_exception,
+                    raise_on_error=raise_on_error,
+                    ignore_status=ignore_status,
+                ):
+                    if ok:
+                        self.doc_count += 1
+                        doc_count += 1
+                    else:
+                        logger.error(f"Document failed to index: {info}")
+                        error_count += 1
+                if pb_span:
+                    pb_span.set_tag("doc_count", doc_count)
+                    pb_span.set_tag("error_count", error_count)
+            finally:
+                if pb_span:
+                    pb_span.__exit__(*sys.exc_info())
 
     def refresh(self, indices: t.List[str]) -> None:
         """Refresh the Elasticsearch/OpenSearch index."""
@@ -226,29 +284,41 @@ class SearchClient(object):
             'uid': ['a002', 'a009'],
         }
         """
-        fields = fields or {}
-        search = self.Search(using=self.__client, index=index)
-        # explicitly exclude all fields since we only need the doc _id
-        search = search.source(excludes=["*"])
-        for key, values in fields.items():
-            search = search.query(
-                self.Bool(
-                    filter=[
-                        self.Q("terms", **{f"{META}.{table}.{key}": values})
-                        | self.Q(
-                            "terms",
-                            **{f"{META}.{table}.{key}.keyword": values},
-                        )
-                    ]
-                )
+        span = None
+        if _dd_tracer:
+            span = _dd_tracer.trace(
+                "pgsync.search.scan", resource="pgsync.search.scan"
             )
+            span.set_tag("index", index)
+            span.set_tag("table", table)
+            span.__enter__()
         try:
-            for hit in search.scan():
-                yield hit.meta.id
-        except elasticsearch.exceptions.RequestError as e:
-            logger.warning(f"RequestError: {e}")
-            if "is out of range for a long" not in str(e):
-                raise
+            fields = fields or {}
+            search = self.Search(using=self.__client, index=index)
+            # explicitly exclude all fields since we only need the doc _id
+            search = search.source(excludes=["*"])
+            for key, values in fields.items():
+                search = search.query(
+                    self.Bool(
+                        filter=[
+                            self.Q("terms", **{f"{META}.{table}.{key}": values})
+                            | self.Q(
+                                "terms",
+                                **{f"{META}.{table}.{key}.keyword": values},
+                            )
+                        ]
+                    )
+                )
+            try:
+                for hit in search.scan():
+                    yield hit.meta.id
+            except elasticsearch.exceptions.RequestError as e:
+                logger.warning(f"RequestError: {e}")
+                if "is out of range for a long" not in str(e):
+                    raise
+        finally:
+            if span:
+                span.__exit__(*sys.exc_info())
 
     def search(self, index: str, body: dict) -> t.Any:
         """
