@@ -27,11 +27,12 @@ except ImportError:
     tracer = None
 
 
+from contextlib import nullcontext as _nullcontext
+
 def _span(name: str, resource: str = None, **tags):
     """Return a context manager that creates a Datadog span if tracer is available."""
     if tracer is None:
-        from contextlib import nullcontext
-        return nullcontext()
+        return _nullcontext()
     s = tracer.trace(name, resource=resource or name)
     for k, v in tags.items():
         if v is not None:
@@ -1155,37 +1156,46 @@ class Sync(Base, metaclass=Singleton):
         ]
 
         """
-        payload: Payload = payloads[0]
-        if payload.tg_op not in TG_OP:
-            logger.exception(f"Unknown tg_op {payload.tg_op}")
-            raise InvalidTGOPError(f"Unknown tg_op {payload.tg_op}")
+        with _span(
+            "pgsync.payloads_validate",
+            resource="pgsync.payloads_validate",
+            payload_count=len(payloads),
+        ) as validate_span:
+            payload: Payload = payloads[0]
+            if payload.tg_op not in TG_OP:
+                logger.exception(f"Unknown tg_op {payload.tg_op}")
+                raise InvalidTGOPError(f"Unknown tg_op {payload.tg_op}")
 
-        # we might receive an event triggered for a table
-        # that is not in the tree node.
-        # e.g a through table which we need to react to.
-        # in this case, we find the parent of the through
-        # table and force a re-sync.
-        if (
-            payload.table not in self.tree.tables
-            or payload.schema not in self.tree.schemas
-        ):
-            return
+            # we might receive an event triggered for a table
+            # that is not in the tree node.
+            # e.g a through table which we need to react to.
+            # in this case, we find the parent of the through
+            # table and force a re-sync.
+            if (
+                payload.table not in self.tree.tables
+                or payload.schema not in self.tree.schemas
+            ):
+                return
 
-        node: Node = self.tree.get_node(payload.table, payload.schema)
+            node: Node = self.tree.get_node(payload.table, payload.schema)
+            if validate_span is not None and hasattr(validate_span, 'set_tag'):
+                validate_span.set_tag("table", node.table)
 
-        for payload in payloads:
-            # this is only required for the non truncate tg_ops
-            if payload.data:
-                if not set(node.model.primary_keys).issubset(
-                    set(payload.data.keys())
-                ):
-                    logger.exception(
-                        f"Primary keys {node.model.primary_keys} not subset "
-                        f"of payload data {payload.data.keys()} for table "
-                        f"{payload.schema}.{payload.table}"
-                    )
-                    raise
+            for payload in payloads:
+                # this is only required for the non truncate tg_ops
+                if payload.data:
+                    if not set(node.model.primary_keys).issubset(
+                        set(payload.data.keys())
+                    ):
+                        logger.exception(
+                            f"Primary keys {node.model.primary_keys} not subset "
+                            f"of payload data {payload.data.keys()} for table "
+                            f"{payload.schema}.{payload.table}"
+                        )
+                        raise
 
+        # node and payload are defined inside the with block above but
+        # accessible here due to Python scoping (with blocks don't create scope)
         logger.debug(f"tg_op: {payload.tg_op} table: {node.name}")
 
         filters: dict = {
@@ -1510,13 +1520,25 @@ class Sync(Base, metaclass=Singleton):
                 payload_count=len(payloads),
                 index=self.index,
                 iteration_type="consumer",
+                mode="sync",
             ):
                 with self.lock:
                     self.count["redis"] += len(payloads)
-                self.refresh_views()
-                self.on_publish(
-                    list(map(lambda payload: Payload(**payload), payloads))
-                )
+                with _span(
+                    "pgsync.refresh_views",
+                    resource="pgsync.refresh_views",
+                    index=self.index,
+                ):
+                    self.refresh_views()
+                with _span(
+                    "pgsync.payload_deserialize",
+                    resource="pgsync.payload_deserialize",
+                    payload_count=len(payloads),
+                ):
+                    parsed = list(
+                        map(lambda payload: Payload(**payload), payloads)
+                    )
+                self.on_publish(parsed)
         time.sleep(settings.REDIS_POLL_INTERVAL)
 
     @threaded
@@ -1540,12 +1562,24 @@ class Sync(Base, metaclass=Singleton):
                 payload_count=len(payloads),
                 index=self.index,
                 iteration_type="consumer",
+                mode="async",
             ):
                 self.count["redis"] += len(payloads)
-                await self.async_refresh_views()
-                await self.async_on_publish(
-                    list(map(lambda payload: Payload(**payload), payloads))
-                )
+                with _span(
+                    "pgsync.refresh_views",
+                    resource="pgsync.refresh_views",
+                    index=self.index,
+                ):
+                    await self.async_refresh_views()
+                with _span(
+                    "pgsync.payload_deserialize",
+                    resource="pgsync.payload_deserialize",
+                    payload_count=len(payloads),
+                ):
+                    parsed = list(
+                        map(lambda payload: Payload(**payload), payloads)
+                    )
+                await self.async_on_publish(parsed)
         await asyncio.sleep(settings.REDIS_POLL_INTERVAL)
 
     @exception
@@ -1586,6 +1620,7 @@ class Sync(Base, metaclass=Singleton):
                         payload_count=len(payloads),
                         index=self.index,
                         iteration_type="producer",
+                        mode="sync",
                     ):
                         self.redis.push(payloads)
                     payloads = []
@@ -1605,6 +1640,7 @@ class Sync(Base, metaclass=Singleton):
                         payload_count=len(payloads),
                         index=self.index,
                         iteration_type="producer",
+                        mode="sync",
                     ):
                         self.redis.push(payloads)
                     payloads = []
@@ -1657,6 +1693,7 @@ class Sync(Base, metaclass=Singleton):
                         payload_count=1,
                         index=self.index,
                         iteration_type="producer",
+                        mode="async",
                     ):
                         self.redis.push([payload])
                     logger.debug(f"async_poll: {payload}")
@@ -1705,10 +1742,15 @@ class Sync(Base, metaclass=Singleton):
         ):
             # this is used for the views.
             # we substitute the views for the base table here
-            for i, payload in enumerate(payloads):
-                for node in self.tree.traverse_breadth_first():
-                    if payload.table in node.base_tables:
-                        payloads[i].table = node.table
+            with _span(
+                "pgsync.view_substitution",
+                resource="pgsync.view_substitution",
+                payload_count=len(payloads),
+            ):
+                for i, payload in enumerate(payloads):
+                    for node in self.tree.traverse_breadth_first():
+                        if payload.table in node.base_tables:
+                            payloads[i].table = node.table
 
             logger.debug(f"on_publish len {len(payloads)}")
             # Safe inserts are insert operations that can be performed in any order
@@ -1749,7 +1791,12 @@ class Sync(Base, metaclass=Singleton):
             txids: t.Set = set(map(lambda x: x.xmin, payloads))
             # for truncate, tg_op txids is None so skip setting the checkpoint
             if txids != set([None]):
-                self.checkpoint: int = min(min(txids), self.txid_current) - 1
+                with _span(
+                    "pgsync.txid_current",
+                    resource="pgsync.txid_current",
+                ):
+                    _txid = self.txid_current
+                self.checkpoint: int = min(min(txids), _txid) - 1
 
     def pull(self, polling: bool = False) -> None:
         """Pull data from db."""

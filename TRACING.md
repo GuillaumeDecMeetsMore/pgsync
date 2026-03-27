@@ -14,13 +14,13 @@ Tracing is implemented with [Datadog ddtrace](https://docs.datadoghq.com/tracing
 - **Redis/Valkey** is used as a queue: the **producer** pushes change notifications; the **consumer** pops them and syncs to the search engine.
 - **Elasticsearch/OpenSearch** receives the denormalized documents.
 
-So in daemon mode you have two main “input” types: **producer** (PG → Redis) and **consumer** (Redis → OpenSearch). One-off runs use a **pull** flow (PG → OpenSearch, with optional WAL replay).
+So in daemon mode you have two main "input" types: **producer** (PG → Redis) and **consumer** (Redis → OpenSearch). One-off runs use a **pull** flow (PG → OpenSearch, with optional WAL replay).
 
 ---
 
 ## Main flows and their traces
 
-Each **trace** corresponds to one “unit of work” (one iteration / one batch). The **root span** is the first span created for that unit of work.
+Each **trace** corresponds to one "unit of work" (one iteration / one batch). The **root span** is the first span created for that unit of work.
 
 ### 1. One-off pull (default run without `-d`)
 
@@ -33,21 +33,31 @@ Each **trace** corresponds to one “unit of work” (one iteration / one batch)
 **Typical span tree:**
 
 ```
-pgsync.pull                    ← root (one trace per schema doc)
-├── pgsync.sync                 ← forward-pass: build queries, fetch rows, yield docs
+pgsync.pull                         ← root (one trace per schema doc)
+├── pgsync.sync                      ← forward-pass: build queries, fetch rows, yield docs
 │   ├── pgsync.query_builder.build
-│   ├── pgsync.fetchmany        ← per-node: full stream from PG, transform, yield
-│   │   └── pgsync.fetchmany.partition  ← one per DB chunk (QUERY_CHUNK_SIZE rows)
-│   └── (postgres spans from fetchmany)
-├── opensearch.bulk             ← index the forward-pass docs
-├── pgsync.logical_slot_changes ← replay WAL and index change events
+│   ├── pgsync.fetchmany             ← per-node: full stream from PG, transform, yield
+│   │   ├── pgsync.db.connect        ← connection pool checkout
+│   │   ├── pgsync.db.execute        ← declare server-side cursor
+│   │   ├── pgsync.db.cursor_fetch   ← FETCH rows from cursor (PG round-trip)
+│   │   ├── pgsync.db.partition_iterate  ← iterate rows + yield
+│   │   ├── pgsync.row_transform     ← Transform.transform + doc building per row
+│   │   ├── pgsync.plugin_transform  ← per-doc plugin (if plugins configured)
+│   │   ├── pgsync.yield_wait        ← generator suspension while bulk processes doc
+│   │   ├── pgsync.db.cursor_close   ← close server-side cursor
+│   │   └── pgsync.db.disconnect     ← return connection to pool
+│   └── (auto-instrumented postgres.query spans)
+├── pgsync.search.bulk               ← index the forward-pass docs
+│   └── pgsync.search.streaming_bulk ← streaming_bulk: serialize + chunk + HTTP
+│       └── (auto-instrumented elasticsearch.query / POST _bulk spans)
+├── pgsync.logical_slot_changes      ← replay WAL and index change events
 │   ├── pgsync.logical_slot (count_changes)
 │   ├── pgsync.logical_slot (peek_changes)
-│   ├── opensearch.bulk         ← per (tg_op, table) batch
+│   ├── pgsync.search.bulk           ← per (tg_op, table) batch
 │   └── pgsync.logical_slot (get_changes)
 ```
 
-**Useful tags:** `index`, `database`, `txmin`, `txmax` on `pgsync.pull`; `batch_size` on `pgsync.logical_slot_changes`.
+**Useful tags:** `index`, `database`, `txmin`, `txmax` on `pgsync.pull`; `row_count` on `pgsync.fetchmany`.
 
 ---
 
@@ -72,36 +82,65 @@ pgsync.poll_db                  ← root (iteration_type=producer)
 
 ### 3. Daemon – consumer (Redis → OpenSearch)
 
-**When:** Daemon mode. The consumer polls Redis; when it gets payloads, it resolves them (filters, views) and syncs to OpenSearch via `on_publish`.
+**When:** Daemon mode. The consumer polls Redis; when it gets payloads, it resolves them (filters, views) and syncs to OpenSearch/Elasticsearch via `on_publish`.
 
-**What happens:** One trace = one “batch of payloads popped from Redis and processed”. The batch is translated into sync operations (often involving `pgsync.sync` and `opensearch.bulk`).
+**What happens:** One trace = one "batch of payloads popped from Redis and processed". The batch is translated into sync operations (often involving `pgsync.sync` and `pgsync.search.bulk`).
 
 **Root span:** `pgsync.poll_redis` (tag: `iteration_type=consumer`)
 
 **Typical span tree:**
 
 ```
-pgsync.poll_redis               ← root (iteration_type=consumer)
-├── (pgsync.redis.pop may appear as child if instrumentation order allows)
-├── pgsync.on_publish            ← handle batch: build filters, call sync, bulk
-│   ├── pgsync.resolve_filters   ← per (tg_op, table) group: build filter dict
-│   │   ├── pgsync.insert_op / pgsync.update_op / pgsync.delete_op
-│   │   │   ├── pgsync.root_pk_resolver    ← batched ES search for root doc IDs
-│   │   │   │   └── opensearch.search
-│   │   │   ├── pgsync.root_fk_resolver    ← batched ES search by foreign keys
-│   │   │   │   └── opensearch.search
-│   │   │   └── pgsync.through_node_resolver  ← through-table FK resolution
-│   │   └── (or pgsync.truncate_op for TRUNCATE)
-│   ├── pgsync.sync              ← per filter chunk (build query + fetch + yield)
-│   │   ├── pgsync.query_builder.build
-│   │   ├── pgsync.fetchmany
-│   │   │   ├── pgsync.fetchmany.partition  ← DB chunk fetch
-│   │   │   └── pgsync.plugin_transform     ← per-doc plugin (if plugins configured)
-│   │   └── (postgres spans)
-│   └── opensearch.bulk         ← one or more per batch
+pgsync.poll_redis                      ← root (iteration_type=consumer)
+├── pgsync.redis.pop                    ← simple pop (LRANGE+LTRIM)
+│   OR pgsync.redis.pop_visible         ← read-only consumer pop (when PG_HOST_RO set)
+│       ├── pgsync.redis.pg_visible_check  ← PG snapshot visibility query
+│       └── pgsync.redis.lrem_loop         ← O(N) lrem per visible item
+├── pgsync.payload_deserialize          ← Payload(**dict) construction for all payloads
+├── pgsync.refresh_views                ← check + refresh materialized views
+│   └── pgsync.refresh_view             ← per-view refresh (if mat views exist)
+├── pgsync.on_publish                   ← handle batch: group payloads, resolve, sync, bulk
+│   ├── pgsync.view_substitution        ← substitute view tables for base tables
+│   │
+│   ├── [per (tg_op, table) group]
+│   │   ├── pgsync.search.bulk          ← wraps bulk() call
+│   │   │   └── pgsync.search.streaming_bulk ← streaming_bulk: serialize + chunk + HTTP
+│   │   │       └── (auto-instrumented elasticsearch.query / POST _bulk spans)
+│   │   │
+│   │   │   [generator _payloads() consumed by streaming_bulk]
+│   │   │   ├── pgsync.payloads_validate    ← validation + get_node + PK check
+│   │   │   ├── pgsync.resolve_filters      ← build filter dict
+│   │   │   │   ├── pgsync.insert_op        ← INSERT: resolve through-table + FK filters
+│   │   │   │   │   ├── pgsync.root_pk_resolver     ← batched search for root doc IDs by PK
+│   │   │   │   │   │   └── pgsync.search.scan
+│   │   │   │   │   ├── pgsync.root_fk_resolver     ← batched search by foreign keys
+│   │   │   │   │   │   └── pgsync.search.scan
+│   │   │   │   │   └── pgsync.through_node_resolver ← through-table direct FK resolution
+│   │   │   │   ├── pgsync.update_op        ← UPDATE: resolve PK + FK filters
+│   │   │   │   │   ├── pgsync.root_pk_resolver
+│   │   │   │   │   └── pgsync.root_fk_resolver
+│   │   │   │   ├── pgsync.delete_op        ← DELETE: resolve PK filters or delete root docs
+│   │   │   │   │   └── pgsync.root_pk_resolver
+│   │   │   │   └── pgsync.truncate_op      ← TRUNCATE: search and delete all matching docs
+│   │   │   │
+│   │   │   └── pgsync.sync                ← per filter chunk: build query + fetch + yield
+│   │   │       ├── pgsync.query_builder.build
+│   │   │       └── pgsync.fetchmany       ← full row stream lifecycle. Tag: row_count
+│   │   │           ├── pgsync.db.connect          ← PG connection pool checkout
+│   │   │           ├── pgsync.db.execute          ← declare server-side cursor
+│   │   │           ├── pgsync.db.cursor_fetch     ← FETCH partition from cursor
+│   │   │           ├── pgsync.db.partition_iterate ← iterate rows in partition + yield
+│   │   │           ├── pgsync.row_transform       ← Transform.transform + doc building
+│   │   │           ├── pgsync.plugin_transform    ← per-doc plugin execution
+│   │   │           ├── pgsync.yield_wait          ← generator suspended for bulk consumer
+│   │   │           ├── pgsync.db.cursor_close     ← close server-side cursor
+│   │   │           └── pgsync.db.disconnect       ← return connection to pool
+│   │
+│   ├── pgsync.txid_current             ← SELECT TXID_CURRENT() or Redis get
+│   └── pgsync.checkpoint.write
 ```
 
-**Useful tags:** On `pgsync.poll_redis`: `index`, `payload_count`, `iteration_type=consumer`. On `pgsync.on_publish`: `tg_ops`, `tables`, `payload_count`.
+**Useful tags:** On `pgsync.poll_redis`: `index`, `payload_count`, `iteration_type=consumer`. On `pgsync.on_publish`: `tg_ops`, `tables`, `payload_count`. On `pgsync.fetchmany`: `table`, `row_count`. On `pgsync.redis.pop_visible`: `peeked_count`, `visible_count`, `lrem_count`.
 
 ---
 
@@ -109,7 +148,7 @@ pgsync.poll_redis               ← root (iteration_type=consumer)
 
 **When:** You run with `--polling` (e.g. read-only PG where replication slots are not available). The process wakes periodically and runs a full pull for each schema doc, then sleeps.
 
-**What happens:** One trace = one “wake-up and pull all docs”. The root span wraps the whole iteration (all docs + sleep is outside).
+**What happens:** One trace = one "wake-up and pull all docs". The root span wraps the whole iteration (all docs + sleep is outside).
 
 **Root span:** `pgsync.polling.iteration` (tag: `iteration_type=polling`)
 
@@ -119,10 +158,10 @@ pgsync.poll_redis               ← root (iteration_type=consumer)
 pgsync.polling.iteration        ← root (iteration_type=polling)
 ├── pgsync.pull                 ← per schema doc (same subtree as in §1)
 │   ├── pgsync.sync
-│   ├── opensearch.bulk
+│   ├── pgsync.search.bulk
 │   └── pgsync.logical_slot_changes
 │       └── ...
-└── (next doc’s pgsync.pull, etc.)
+└── (next doc's pgsync.pull, etc.)
 ```
 
 **Useful tags:** `iteration_type=polling`.
@@ -150,76 +189,137 @@ pgsync.analyze                  ← root (iteration_type=analyze)
 
 ## Span reference (quick lookup)
 
-| Span name (resource)              | Where it runs              | Meaning |
-|----------------------------------|----------------------------|--------|
-| `pgsync.pull`                    | One-off sync, polling loop | Full sync from DB to OpenSearch for one schema (forward pass + WAL replay). |
-| `pgsync.poll_db`                 | Daemon producer            | One batch of PG notifications pushed to Redis. Tag: `iteration_type=producer`. |
-| `pgsync.poll_redis`              | Daemon consumer            | One batch of payloads popped from Redis and processed. Tag: `iteration_type=consumer`. |
-| `pgsync.polling.iteration`       | Polling mode               | One wake-up: pull all schema docs. Tag: `iteration_type=polling`. |
-| `pgsync.analyze`                 | Analyze mode               | Index analysis for one schema. Tag: `iteration_type=analyze`. |
-| `pgsync.sync`                    | Inside pull or on_publish  | Build queries, fetch rows from PG, transform to docs (generator). |
-| `pgsync.query_builder.build`     | Inside pgsync.sync          | Build SQL for one node (table) in the tree. |
-| `pgsync.fetchmany`               | Inside pgsync.sync          | Wraps the full consumption of the fetchmany generator (one per node; streaming fetch + transform). Tag: `table`. |
-| `pgsync.fetchmany.partition`     | base.py, inside fetchmany   | One per DB chunk: time to fetch one partition (up to `chunk_size` rows) from Postgres. Tags: `chunk_size`, `partition_index`. |
-| `pgsync.on_publish`              | Daemon consumer             | Handle one batch of Redis payloads: apply filters, call sync, bulk to OpenSearch. |
-| `pgsync.resolve_filters`        | Inside _payloads (consumer) | Wraps all filter resolution for one (tg_op, table) group. Tags: `table`, `tg_op`, `is_root`, `is_through`, `payload_count`. |
-| `pgsync.insert_op`              | Inside resolve_filters      | INSERT operation: resolve through-table and FK filters. Tags: `table`, `is_through`, `is_root`, `payload_count`. |
-| `pgsync.update_op`              | Inside resolve_filters      | UPDATE operation: resolve PK and FK filters. Tags: `table`, `is_root`, `payload_count`. |
-| `pgsync.delete_op`              | Inside resolve_filters      | DELETE operation: resolve PK filters or delete root docs. Tags: `table`, `is_root`, `payload_count`. |
-| `pgsync.truncate_op`            | Inside resolve_filters      | TRUNCATE operation: search and delete all matching docs. Tags: `table`, `is_root`. |
-| `pgsync.root_pk_resolver`       | Inside *_op spans           | Batched ES search to find root doc IDs by child primary keys. Tags: `table`, `payload_count`. |
-| `pgsync.root_fk_resolver`       | Inside *_op spans           | Batched ES search to find root doc IDs by child foreign keys. Tags: `table`, `payload_count`. |
-| `pgsync.through_node_resolver`  | Inside insert_op            | Resolve through-table direct references to root. Tags: `table`, `payload_count`. |
-| `pgsync.plugin_transform`       | Inside pgsync.sync (fetchmany loop) | Per-doc plugin transformation (e.g. JobCustomFields, Clients). Tags: `index`, `doc_id`. |
-| `pgsync.logical_slot_changes`    | Inside pull                 | Replay WAL: get changes from logical slot, group by (tg_op, table), bulk index. |
-| `pgsync.logical_slot`            | base.py                    | Resource: `get_changes` \| `peek_changes` \| `count_changes` – low-level WAL slot I/O. |
-| `pgsync.redis.pop`               | redisqueue.py              | Pop items from Redis queue (simple LRANGE+LTRIM path). |
-| `pgsync.redis.pop_visible`      | redisqueue.py              | Pop items visible in PG snapshot (read-only consumer path, uses lrem). Tags: `peeked_count`, `visible_count`, `lrem_count`. |
-| `pgsync.redis.pg_visible_check` | redisqueue.py              | PG snapshot visibility query for xmins. Tag: `xmin_count`. |
-| `pgsync.redis.lrem_loop`        | redisqueue.py              | O(N) lrem loop — known bottleneck when queue is large. Tags: `lrem_count`, `visible_count`. |
-| `pgsync.redis.push`             | redisqueue.py              | Push items to Redis queue. |
-| `opensearch.bulk`               | search_client.py           | Bulk-index a chunk of documents. |
-| `opensearch.search`             | search_client.py           | Search (e.g. for primary-key resolution). |
-| `pgsync.refresh_view`           | sync.py                    | Postgres REFRESH MATERIALIZED VIEW (I/O). Tags: `table`, `schema`. |
-| `pgsync.checkpoint.read`        | sync.py                    | Read checkpoint from file or Redis (I/O). |
-| `pgsync.checkpoint.write`       | sync.py                    | Write checkpoint to file or Redis (I/O). |
-| `pgsync.truncate_slots`         | sync.py                    | Consume replication slot to advance (I/O; wraps logical_slot.get_changes). Tag: `slot_name`. |
+### Flow control spans
+
+| Span | File | Meaning |
+|------|------|---------|
+| `pgsync.pull` | sync.py | Full sync: forward pass + WAL replay for one schema. |
+| `pgsync.poll_db` | sync.py | Producer: one batch of PG notifications pushed to Redis. |
+| `pgsync.poll_redis` | sync.py | Consumer: one batch of payloads popped and processed. |
+| `pgsync.polling.iteration` | sync.py | Polling mode: one wake-up cycle. |
+| `pgsync.analyze` | sync.py | Index analysis for one schema. |
+| `pgsync.on_publish` | sync.py | Handle one batch: group, resolve filters, sync, bulk. |
+| `pgsync.payload_deserialize` | sync.py | Construct Payload objects from Redis dicts. |
+| `pgsync.refresh_views` | sync.py | Check and refresh materialized views. |
+| `pgsync.view_substitution` | sync.py | Substitute view tables for base tables in payloads. |
+| `pgsync.payloads_validate` | sync.py | Validation + get_node + PK check per payload group. |
+| `pgsync.txid_current` | sync.py | SELECT TXID_CURRENT() or Redis get for checkpoint. |
+
+### Filter resolution spans
+
+| Span | File | Meaning |
+|------|------|---------|
+| `pgsync.resolve_filters` | sync.py | Wraps all filter resolution for one (tg_op, table) group. |
+| `pgsync.insert_op` | sync.py | INSERT filter resolution. |
+| `pgsync.update_op` | sync.py | UPDATE filter resolution. |
+| `pgsync.delete_op` | sync.py | DELETE filter resolution. |
+| `pgsync.truncate_op` | sync.py | TRUNCATE: search and delete all matching docs. |
+| `pgsync.root_pk_resolver` | sync.py | Batched search to find root doc IDs by child primary keys. |
+| `pgsync.root_fk_resolver` | sync.py | Batched search to find root doc IDs by child foreign keys. |
+| `pgsync.through_node_resolver` | sync.py | Through-table direct FK resolution. |
+
+### Sync + fetch spans
+
+| Span | File | Meaning |
+|------|------|---------|
+| `pgsync.sync` | sync.py | Per filter chunk: build query, fetch rows, yield docs. |
+| `pgsync.query_builder.build` | sync.py | Build SQL for one node in the tree. |
+| `pgsync.fetchmany` | sync.py | Full row stream lifecycle: connect → fetch → iterate → transform → yield → close. Tags: `table`, `row_count`. |
+| `pgsync.row_transform` | sync.py | Transform.transform + doc dict building per row. |
+| `pgsync.plugin_transform` | sync.py | Per-doc plugin execution (e.g. JobCustomFields, Clients). |
+| `pgsync.yield_wait` | sync.py | Time generator is suspended while bulk consumer processes doc. |
+
+### Database spans (base.py)
+
+| Span | File | Meaning |
+|------|------|---------|
+| `pgsync.db.connect` | base.py | Connection pool checkout. |
+| `pgsync.db.execute` | base.py | Declare server-side cursor (`stream_results`). |
+| `pgsync.db.cursor_fetch` | base.py | FETCH partition from server-side cursor (PG round-trip). |
+| `pgsync.db.partition_iterate` | base.py | Iterate rows in partition + yield to consumer. |
+| `pgsync.db.cursor_close` | base.py | Close server-side cursor. |
+| `pgsync.db.disconnect` | base.py | Return connection to pool + clear compiled cache. |
+| `pgsync.logical_slot_changes` | sync.py | Replay WAL: get changes from logical slot, group, bulk index. |
+| `pgsync.logical_slot` | base.py | Resource: `get_changes` \| `peek_changes` \| `count_changes`. |
+
+### Search engine spans (search_client.py)
+
+| Span | File | Meaning |
+|------|------|---------|
+| `pgsync.search.bulk` | search_client.py | Bulk-index docs (wraps streaming_bulk or parallel_bulk). |
+| `pgsync.search.streaming_bulk` | search_client.py | streaming_bulk consumption: serialization + chunking + HTTP. Tags: `chunk_size`, `max_retries`, `doc_count`, `error_count`. |
+| `pgsync.search.parallel_bulk` | search_client.py | parallel_bulk consumption. Tags: `chunk_size`, `thread_count`, `queue_size`, `doc_count`, `error_count`. |
+
+| `pgsync.search.scan` | search_client.py | Scroll search for primary-key resolution. |
+
+
+### Redis spans (redisqueue.py)
+
+| Span | File | Meaning |
+|------|------|---------|
+| `pgsync.redis.pop` | redisqueue.py | Simple pop (LRANGE+LTRIM). |
+| `pgsync.redis.pop_visible` | redisqueue.py | Read-only consumer pop (when PG_HOST_RO set). Tags: `peeked_count`, `visible_count`, `lrem_count`. |
+| `pgsync.redis.pg_visible_check` | redisqueue.py | PG snapshot visibility query for xmins. |
+| `pgsync.redis.lrem_loop` | redisqueue.py | O(N) lrem loop — known bottleneck when queue is large. |
+| `pgsync.redis.push` | redisqueue.py | Push items to Redis queue. |
+
+### Other spans
+
+| Span | File | Meaning |
+|------|------|---------|
+| `pgsync.refresh_view` | sync.py | REFRESH MATERIALIZED VIEW. |
+| `pgsync.checkpoint.read` | sync.py | Read checkpoint from file or Redis. |
+| `pgsync.checkpoint.write` | sync.py | Write checkpoint to file or Redis. |
+| `pgsync.truncate_slots` | sync.py | Consume replication slot to advance. |
 
 ---
 
 ## Tags useful in Datadog
 
-- **`iteration_type`** – `producer` \| `consumer` \| `polling` \| `analyze`. Use to filter by “kind” of work (e.g. only consumer traces).
+- **`iteration_type`** – `producer` \| `consumer` \| `polling` \| `analyze`. Use to filter by "kind" of work (e.g. only consumer traces).
 - **`index`** – Search index / schema name.
 - **`payload_count`** – Number of change events in the batch (producer/consumer).
+- **`row_count`** – Number of rows processed in a fetchmany call.
 - **`tg_ops`** – Trigger operations in the batch (e.g. `INSERT,UPDATE`).
 - **`tables`** – Tables touched in the batch.
-- **`database`** – PostgreSQL database name (e.g. on `pgsync.pull`).
-- **`txmin` / `txmax`** – Transaction ID range for a pull.
-- **`slot_name`** – Replication slot (logical_slot spans).
-- **`queue_key`** – Redis queue key (redis pop/push).
+- **`table`** – Single table name on per-node spans.
+- **`tg_op`** – Single trigger operation on resolve_filters.
+- **`is_root`** / **`is_through`** – Node type flags.
+- **`database`** – PostgreSQL database name.
+- **`txmin`** / **`txmax`** – Transaction ID range for a pull.
+- **`slot_name`** – Replication slot name.
+- **`queue_key`** – Redis queue key.
+- **`filter_size`** – Number of root table filters in a sync call.
+- **`chunk_size`** / **`partition_index`** – DB fetch pagination.
+- **`peeked_count`** / **`visible_count`** / **`lrem_count`** – Read-only consumer stats.
+
+- **`exhausted`** – True when cursor_fetch finds no more partitions.
+- **`stream_results`** – Whether server-side cursor is used.
 
 ---
 
 ## Tips for performance debugging in Datadog
 
-1. **Filter by operation/resource**  
+1. **Filter by operation/resource**
    Use `resource_name:pgsync.poll_redis` to see consumer iterations; `resource_name:pgsync.poll_db` for producer.
 
-2. **Filter by iteration type**  
+2. **Filter by iteration type**
    Use `iteration_type:consumer` or `iteration_type:producer` to separate daemon producer vs consumer traffic.
 
-3. **Where time goes in a consumer trace**  
+3. **Where time goes in a consumer trace**
    Open a `pgsync.poll_redis` trace and compare:
-   - Time in `pgsync.on_publish` vs children (`pgsync.sync`, `opensearch.bulk`).
-   - Many or slow `opensearch.bulk` → index or network bottleneck.
+   - Time in `pgsync.on_publish` vs children (`pgsync.sync`, `pgsync.search.bulk`).
+   - Many or slow `pgsync.search.bulk` → index or network bottleneck.
    - Long `pgsync.sync` or `pgsync.query_builder.build` → query building or DB fetch cost.
+   - Long `pgsync.fetchmany` → drill into `pgsync.db.*` spans to see if time is in `db.cursor_fetch` (PG round-trip), `db.connect` (pool exhaustion), or `pgsync.yield_wait` (bulk consumer backpressure).
+   - Long `pgsync.resolve_filters` → check which `*_op` and `*_resolver` spans dominate. Large `pgsync.search.scan` times indicate slow scroll searches.
+   - Slow `pgsync.redis.pop_visible` → check `pgsync.redis.lrem_loop` — the O(N) `lrem` calls scale linearly with queue size.
 
-4. **Where time goes in a pull trace**  
+4. **Where time goes in a pull trace**
    In a `pgsync.pull` trace:
-   - Long `pgsync.sync` → forward-pass query or fetch (check postgres spans).
+   - Long `pgsync.sync` → forward-pass query or fetch (check `pgsync.db.*` and postgres spans).
    - Long `pgsync.logical_slot_changes` or `pgsync.logical_slot` → WAL read or slot I/O.
-   - Long `opensearch.bulk` → index write cost.
+   - Long `pgsync.search.bulk` → index write cost.
 
-5. **Auto-instrumentation**  
+5. **Auto-instrumentation**
    `bin/pgsync` calls `patch_all()`, so you also get Datadog spans for **postgres**, **redis**, and **elasticsearch**/HTTP where applicable. Use them to see actual DB/Redis/OpenSearch time inside the PGSync spans above.

@@ -1197,11 +1197,12 @@ class Base(object):
         chunk_size = chunk_size or QUERY_CHUNK_SIZE
         stream_results = stream_results or STREAM_RESULTS
 
+        # --- connect ---
         conn_span = None
         if _dd_tracer:
             conn_span = _dd_tracer.trace(
-                "pgsync.fetchmany.connect",
-                resource="pgsync.fetchmany.connect",
+                "pgsync.db.connect",
+                resource="pgsync.db.connect",
             )
             conn_span.__enter__()
         try:
@@ -1212,11 +1213,12 @@ class Base(object):
                 conn_span.__exit__(*sys.exc_info())
 
         try:
+            # --- execute (declare cursor) ---
             exec_span = None
             if _dd_tracer:
                 exec_span = _dd_tracer.trace(
-                    "pgsync.fetchmany.execute",
-                    resource="pgsync.fetchmany.execute",
+                    "pgsync.db.execute",
+                    resource="pgsync.db.execute",
                 )
                 exec_span.set_tag("stream_results", stream_results)
                 exec_span.__enter__()
@@ -1228,41 +1230,59 @@ class Base(object):
                 if exec_span:
                     exec_span.__exit__(*sys.exc_info())
 
-            for partition_index, partition in enumerate(result.partitions(chunk_size)):
+            # --- iterate partitions manually so we can span the FETCH ---
+            partitions_iter = result.partitions(chunk_size)
+            partition_index = 0
+            while True:
+                # span the actual FETCH from server-side cursor
                 fetch_span = None
                 if _dd_tracer:
                     fetch_span = _dd_tracer.trace(
-                        "pgsync.fetchmany.partition_fetch",
-                        resource="pgsync.fetchmany.partition_fetch",
+                        "pgsync.db.cursor_fetch",
+                        resource="pgsync.db.cursor_fetch",
                     )
                     fetch_span.set_tag("chunk_size", chunk_size)
                     fetch_span.set_tag("partition_index", partition_index)
                     fetch_span.__enter__()
-                # partition data is already fetched at this point
-                if fetch_span:
-                    fetch_span.__exit__(None, None, None)
+                exhausted = False
+                try:
+                    partition = next(partitions_iter)
+                except StopIteration:
+                    exhausted = True
+                    if fetch_span:
+                        fetch_span.set_tag("exhausted", True)
+                finally:
+                    if fetch_span:
+                        # Use None to avoid marking StopIteration as an error
+                        fetch_span.__exit__(None, None, None)
+                if exhausted:
+                    break
 
-                span = None
+                # --- iterate rows in partition ---
+                row_span = None
                 if _dd_tracer:
-                    span = _dd_tracer.trace(
-                        "pgsync.fetchmany.partition",
-                        resource="pgsync.fetchmany.partition",
+                    row_span = _dd_tracer.trace(
+                        "pgsync.db.partition_iterate",
+                        resource="pgsync.db.partition_iterate",
                     )
-                    span.set_tag("chunk_size", chunk_size)
-                    span.set_tag("partition_index", partition_index)
-                    span.__enter__()
+                    row_span.set_tag("chunk_size", chunk_size)
+                    row_span.set_tag("partition_index", partition_index)
+                    row_span.__enter__()
                 try:
                     for keys, row, *primary_keys in partition:
                         yield keys, row, primary_keys
                 finally:
-                    if span:
-                        span.__exit__(*sys.exc_info())
+                    if row_span:
+                        row_span.__exit__(*sys.exc_info())
 
+                partition_index += 1
+
+            # --- close result (cursor cleanup) ---
             close_span = None
             if _dd_tracer:
                 close_span = _dd_tracer.trace(
-                    "pgsync.fetchmany.result_close",
-                    resource="pgsync.fetchmany.result_close",
+                    "pgsync.db.cursor_close",
+                    resource="pgsync.db.cursor_close",
                 )
                 close_span.__enter__()
             try:
@@ -1271,8 +1291,20 @@ class Base(object):
                 if close_span:
                     close_span.__exit__(*sys.exc_info())
         finally:
-            conn_ctx.__exit__(None, None, None)
-            self.engine.clear_compiled_cache()
+            # --- connection return to pool ---
+            disconnect_span = None
+            if _dd_tracer:
+                disconnect_span = _dd_tracer.trace(
+                    "pgsync.db.disconnect",
+                    resource="pgsync.db.disconnect",
+                )
+                disconnect_span.__enter__()
+            try:
+                conn_ctx.__exit__(None, None, None)
+                self.engine.clear_compiled_cache()
+            finally:
+                if disconnect_span:
+                    disconnect_span.__exit__(*sys.exc_info())
 
     def fetchcount(self, statement: sa.sql.Subquery) -> int:
         with self.engine.connect() as conn:

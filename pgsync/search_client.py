@@ -144,7 +144,7 @@ class SearchClient(object):
         span = None
         if _dd_tracer:
             span = _dd_tracer.trace(
-                "opensearch.bulk", resource="opensearch.bulk"
+                "pgsync.search.bulk", resource="pgsync.search.bulk"
             )
             span.set_tag("index", index)
             span.set_tag("chunk_size", chunk_size)
@@ -173,30 +173,6 @@ class SearchClient(object):
             if span:
                 span.__exit__(*sys.exc_info())
 
-    @staticmethod
-    def _instrumented_actions(actions, index):
-        """Wrap actions generator to measure time between pulls."""
-        import time as _time
-        last_yield_time = None
-        doc_count = 0
-        for doc in actions:
-            now = _time.monotonic()
-            if last_yield_time is not None:
-                gap = now - last_yield_time
-                if _dd_tracer and gap > 0.1:
-                    # Only trace gaps > 100ms to avoid span flood
-                    span = _dd_tracer.trace(
-                        "pgsync.bulk_consumer_gap",
-                        resource="pgsync.bulk_consumer_gap",
-                    )
-                    span.set_tag("gap_seconds", round(gap, 3))
-                    span.set_tag("doc_index", doc_count)
-                    span.set_tag("index", index)
-                    span.finish()
-            doc_count += 1
-            yield doc
-            last_yield_time = _time.monotonic()
-
     def _bulk(
         self,
         index: str,
@@ -215,42 +191,83 @@ class SearchClient(object):
     ):
         """Bulk index, update, delete docs to Elasticsearch/OpenSearch."""
         if settings.ELASTICSEARCH_STREAMING_BULK:
-            for ok, info in self.streaming_bulk(
-                self.__client,
-                self._instrumented_actions(actions, index),
-                index=index,
-                chunk_size=chunk_size,
-                max_chunk_bytes=max_chunk_bytes,
-                max_retries=max_retries,
-                max_backoff=max_backoff,
-                initial_backoff=initial_backoff,
-                refresh=refresh,
-                raise_on_exception=raise_on_exception,
-                raise_on_error=raise_on_error,
-            ):
-                if ok:
-                    self.doc_count += 1
-                else:
-                    logger.error(f"Document failed to index: {info}")
+            sb_span = None
+            if _dd_tracer:
+                sb_span = _dd_tracer.trace(
+                    "pgsync.search.streaming_bulk",
+                    resource="pgsync.search.streaming_bulk",
+                )
+                sb_span.set_tag("chunk_size", chunk_size)
+                sb_span.set_tag("max_retries", max_retries)
+                sb_span.__enter__()
+            try:
+                doc_count = 0
+                error_count = 0
+                for ok, info in self.streaming_bulk(
+                    self.__client,
+                    actions,
+                    index=index,
+                    chunk_size=chunk_size,
+                    max_chunk_bytes=max_chunk_bytes,
+                    max_retries=max_retries,
+                    max_backoff=max_backoff,
+                    initial_backoff=initial_backoff,
+                    refresh=refresh,
+                    raise_on_exception=raise_on_exception,
+                    raise_on_error=raise_on_error,
+                ):
+                    if ok:
+                        self.doc_count += 1
+                        doc_count += 1
+                    else:
+                        logger.error(f"Document failed to index: {info}")
+                        error_count += 1
+                if sb_span:
+                    sb_span.set_tag("doc_count", doc_count)
+                    sb_span.set_tag("error_count", error_count)
+            finally:
+                if sb_span:
+                    sb_span.__exit__(*sys.exc_info())
         else:
             # parallel bulk consumes more memory and is also more likely
             # to result in 429 errors.
-            for ok, info in self.parallel_bulk(
-                self.__client,
-                actions,
-                thread_count=thread_count,
-                chunk_size=chunk_size,
-                max_chunk_bytes=max_chunk_bytes,
-                queue_size=queue_size,
-                refresh=refresh,
-                raise_on_exception=raise_on_exception,
-                raise_on_error=raise_on_error,
-                ignore_status=ignore_status,
-            ):
-                if ok:
-                    self.doc_count += 1
-                else:
-                    logger.error(f"Document failed to index: {info}")
+            pb_span = None
+            if _dd_tracer:
+                pb_span = _dd_tracer.trace(
+                    "pgsync.search.parallel_bulk",
+                    resource="pgsync.search.parallel_bulk",
+                )
+                pb_span.set_tag("chunk_size", chunk_size)
+                pb_span.set_tag("thread_count", thread_count)
+                pb_span.set_tag("queue_size", queue_size)
+                pb_span.__enter__()
+            try:
+                doc_count = 0
+                error_count = 0
+                for ok, info in self.parallel_bulk(
+                    self.__client,
+                    actions,
+                    thread_count=thread_count,
+                    chunk_size=chunk_size,
+                    max_chunk_bytes=max_chunk_bytes,
+                    queue_size=queue_size,
+                    refresh=refresh,
+                    raise_on_exception=raise_on_exception,
+                    raise_on_error=raise_on_error,
+                    ignore_status=ignore_status,
+                ):
+                    if ok:
+                        self.doc_count += 1
+                        doc_count += 1
+                    else:
+                        logger.error(f"Document failed to index: {info}")
+                        error_count += 1
+                if pb_span:
+                    pb_span.set_tag("doc_count", doc_count)
+                    pb_span.set_tag("error_count", error_count)
+            finally:
+                if pb_span:
+                    pb_span.__exit__(*sys.exc_info())
 
     def refresh(self, indices: t.List[str]) -> None:
         """Refresh the Elasticsearch/OpenSearch index."""
@@ -270,7 +287,7 @@ class SearchClient(object):
         span = None
         if _dd_tracer:
             span = _dd_tracer.trace(
-                "opensearch.search", resource="opensearch.search"
+                "pgsync.search.scan", resource="pgsync.search.scan"
             )
             span.set_tag("index", index)
             span.set_tag("table", table)
